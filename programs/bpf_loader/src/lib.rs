@@ -29,7 +29,7 @@ use {
         memory_region::{AccessType, MemoryCowCallback, MemoryMapping, MemoryRegion},
         program::BuiltinProgram,
         verifier::RequisiteVerifier,
-        vm::{ContextObject, EbpfVm},
+        vm::{Config, ContextObject, EbpfVm},
     },
     solana_sdk::{
         account::WritableAccount,
@@ -252,6 +252,7 @@ pub fn create_vm<'a, 'b>(
     let accounts = Rc::clone(invoke_context.transaction_context.accounts());
     let memory_mapping = create_memory_mapping(
         program,
+        &invoke_context.config,
         stack,
         heap,
         regions,
@@ -293,7 +294,7 @@ pub fn create_vm<'a, 'b>(
 macro_rules! create_vm {
     ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $invoke_context:expr $(,)?) => {
         let invoke_context = &*$invoke_context;
-        let stack_size = $program.get_config().stack_size();
+        let stack_size = invoke_context.config.stack_size();
         let heap_size = invoke_context.get_compute_budget().heap_size;
         let heap_cost_result = invoke_context.consume_checked($crate::calculate_heap_cost(
             heap_size,
@@ -348,13 +349,14 @@ macro_rules! mock_create_vm {
 
 fn create_memory_mapping<'a, 'b, C: ContextObject>(
     executable: &'a Executable<C>,
+    config: &Config,
     stack: &'b mut [u8],
     heap: &'b mut [u8],
     additional_regions: Vec<MemoryRegion>,
     cow_cb: Option<MemoryCowCallback>,
 ) -> Result<MemoryMapping<'a>, Box<dyn std::error::Error>> {
-    let config = executable.get_config();
     let sbpf_version = executable.get_sbpf_version();
+    let config = unsafe { std::mem::transmute::<&Config, &'a Config>(config) };
     let regions: Vec<MemoryRegion> = vec![
         executable.get_ro_region(),
         MemoryRegion::new_writable_gapped(
@@ -1354,10 +1356,7 @@ pub fn execute<'a, 'b: 'a>(
             *program_account.get_owner() == bpf_loader_deprecated::id(),
         )
     };
-    #[cfg(any(target_os = "windows", not(target_arch = "x86_64")))]
-    let use_jit = false;
-    #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
-    let use_jit = executable.get_compiled_program().is_some();
+    let use_jit = !invoke_context.direct_mapping;
     let direct_mapping = invoke_context
         .get_feature_set()
         .is_active(&bpf_account_data_direct_mapping::id());

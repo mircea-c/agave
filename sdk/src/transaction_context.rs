@@ -55,8 +55,8 @@ pub type TransactionAccount = (Pubkey, AccountSharedData);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransactionAccounts {
-    accounts: Vec<RefCell<AccountSharedData>>,
-    touched_flags: RefCell<Box<[bool]>>,
+    pub accounts: Vec<RefCell<AccountSharedData>>,
+    pub touched_flags: RefCell<Box<[bool]>>,
 }
 
 impl TransactionAccounts {
@@ -132,7 +132,7 @@ impl TransactionAccounts {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransactionContext {
     account_keys: Pin<Box<[Pubkey]>>,
-    accounts: Rc<TransactionAccounts>,
+    pub accounts: Rc<TransactionAccounts>,
     instruction_stack_capacity: usize,
     instruction_trace_capacity: usize,
     instruction_stack: Vec<usize>,
@@ -454,6 +454,68 @@ pub struct InstructionContext {
     instruction_accounts: Vec<InstructionAccount>,
     instruction_data: Vec<u8>,
 }
+
+solana_sdk::pubkeys!(
+    broken_direct_mapping,
+    [
+        // instruction modified data of an account it does not own
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+        // instruction modified data of an account it does not own
+        "3GRE3mhckAosTkYXfVvHm5WrW1AxK4aKp8LfoXLxEUYs",
+        // Program EZiUb6ydWpR3ciizBTJ1J36KCqLyPKVjh4yZEJbs5Uno failed: Access violation in input section at address 0x40001f310 of size 8
+        "EZiUb6ydWpR3ciizBTJ1J36KCqLyPKVjh4yZEJbs5Uno",
+        // Program failed: instruction modified data of an account it does not own
+        "E1emntd1y2UrkWEECuceaLvGAkq9WK6kyWrNjKiP14mT",
+        // Program EMnmGvrgKJhYCk2HCbUQfSXLDjdCjv3FAfdKcNz8A9Kr failed: instruction modified data of an account it does not own
+        "EMnmGvrgKJhYCk2HCbUQfSXLDjdCjv3FAfdKcNz8A9Kr",
+        // Program So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo failed: instruction modified data of a read-only account
+        "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+        // Program UBEBk5idELqykEEaycYtQ7iBVrCg6NmvFSzMpdr22mL failed: instruction modified data of a read-only account
+        "UBEBk5idELqykEEaycYtQ7iBVrCg6NmvFSzMpdr22mL",
+        // Program 5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h failed: instruction modified data of an account it does not own
+        "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h",
+        // Program TLPv2tuSVvn3fSk8RgW3yPddkp5oFivzZV3rA9hQxtX failed: Access violation in input section at address 0x40003fff0 of size 8
+        "TLPv2tuSVvn3fSk8RgW3yPddkp5oFivzZV3rA9hQxtX",
+        // Program 36z9tipgENz4wgt2XxnxXZVYQMtDPNw5UXeucYcH9dXv failed: instruction modified data of an account it does not own
+        "36z9tipgENz4wgt2XxnxXZVYQMtDPNw5UXeucYcH9dXv",
+        // Program CcrAd4QH71GHcC5wBRkSsMUBjrMbqaGXULm5azpRMycb failed: instruction modified data of an account it does not own
+        "CcrAd4QH71GHcC5wBRkSsMUBjrMbqaGXULm5azpRMycb",
+        // Program 3Qvevpr9VQp7ECWjAU186oiSGjMhDucjU32oSX8BfxGK failed: instruction modified data of a read-only account
+        "3Qvevpr9VQp7ECWjAU186oiSGjMhDucjU32oSX8BfxGK",
+        // Program HvwYjjzPbXWpykgVZhqvvfeeaSraQVnTiQibofaFw9M7 failed: instruction modified data of an account it does not own
+        "HvwYjjzPbXWpykgVZhqvvfeeaSraQVnTiQibofaFw9M7",
+        // Program Bt2WPMmbwHPk36i4CRucNDyLcmoGdC7xEdrVuxgJaNE6 failed: instruction modified data of a read-only account
+        "Bt2WPMmbwHPk36i4CRucNDyLcmoGdC7xEdrVuxgJaNE6",
+        // Program Gd9yhiRgrggdz2bJfntC2H1sRwzuzDssdhEmUFrC1STF failed: instruction modified data of a read-only account
+        "Gd9yhiRgrggdz2bJfntC2H1sRwzuzDssdhEmUFrC1STF",
+        // Program FVP4fqjp3VHyPgkzjUwjcUcWv2DiYffW4PfbKPz8Tfx3 failed: Access violation in input section at address 0x40000cd58 of size 8
+        "FVP4fqjp3VHyPgkzjUwjcUcWv2DiYffW4PfbKPz8Tfx3",
+        // Program 93BgeoLHo5AdNbpqy9bD12dtfxtA5M2fh3rj72bE35Y3 failed: instruction modified data of an account it does not own
+        "93BgeoLHo5AdNbpqy9bD12dtfxtA5M2fh3rj72bE35Y3",
+        // Program C7QKj6iL11tNRmkCRfhTAisz3u8XqzfTDG5QK4FBncsT failed: instruction modified data of an account it does not own
+        "C7QKj6iL11tNRmkCRfhTAisz3u8XqzfTDG5QK4FBncsT",
+        //  Program DfRaLw1aViwxsYVPTYePJHLmqYT4vRp4T3tuW78mMcTB failed: instruction modified data of an account it does not own
+        "DfRaLw1aViwxsYVPTYePJHLmqYT4vRp4T3tuW78mMcTB",
+        // Invalid account info pointer `data': 0x400025e3e != 0x400025cf8
+        "919AnvG1Vi9ekoxQs6d6SYQiRmYMcinw4U6bzL2YNoFM",
+        // Program G9auK4uUuPhPx5wTmM1GzPfn66Y3wyxH2kWLmLtHbUkc failed: instruction modified data of an account it does not own
+        "G9auK4uUuPhPx5wTmM1GzPfn66Y3wyxH2kWLmLtHbUkc",
+        // Program JCBK6gywbdyX3NTzs4jz9ovmmt85cLpgn1ipCM4kMpkX failed: instruction modified data of a read-only account
+        "JCBK6gywbdyX3NTzs4jz9ovmmt85cLpgn1ipCM4kMpkX",
+        // Program 4jTsajWEA7juPVKznD1n6jxpNckvuV3qy3EefNQd259X failed: instruction modified data of an account it does not own
+        "4jTsajWEA7juPVKznD1n6jxpNckvuV3qy3EefNQd259X",
+        // Program BX3FhBym2wQPj8PF3GeAJqifsr4XkPXRFTdH1zqNwqjz failed: instruction modified data of an account it does not own
+        "BX3FhBym2wQPj8PF3GeAJqifsr4XkPXRFTdH1zqNwqjz",
+        // Program BEdryY16Ywr8zH7mugaXGbD1WE2F1PDkYBquTSrornGf failed: instruction modified data of an account it does not own
+        "BEdryY16Ywr8zH7mugaXGbD1WE2F1PDkYBquTSrornGf",
+        // Program EpQzTPNq2wXgedV1f6evMCW63XckDVwTqtHFroLfqWcL failed: instruction modified data of an account it does not own
+        "EpQzTPNq2wXgedV1f6evMCW63XckDVwTqtHFroLfqWcL",
+        // Program H9357nUdpMhyfTVgsGZihM6C7QeqpDEPbXS1S6m2X9Je failed: instruction modified data of an account it does not own
+        "H9357nUdpMhyfTVgsGZihM6C7QeqpDEPbXS1S6m2X9Je",
+        // Program 2ZVkcwxHGz44knXHaS81Upx2fpYP4vh94LuT7WJtKktc failed: instruction modified data of an account it does not own
+        "2ZVkcwxHGz44knXHaS81Upx2fpYP4vh94LuT7WJtKktc"
+    ]
+);
 
 impl InstructionContext {
     /// Used together with TransactionContext::get_next_instruction_context()

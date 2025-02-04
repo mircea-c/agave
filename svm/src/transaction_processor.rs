@@ -1,5 +1,6 @@
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::{field_qualifiers, qualifiers};
+use solana_sdk::transaction_context::IndexOfAccount;
 use {
     crate::{
         account_loader::{
@@ -25,7 +26,9 @@ use {
     },
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_feature_set::{
-        enable_transaction_loading_failure_fees, remove_rounding_in_fee_calculation, FeatureSet,
+        bpf_account_data_direct_mapping, enable_transaction_loading_failure_fees,
+        error_on_syscall_bpf_function_hash_collisions, reject_callx_r10,
+        remove_rounding_in_fee_calculation, switch_to_new_elf_parser, FeatureSet,
     },
     solana_log_collector::LogCollector,
     solana_measure::{measure::Measure, measure_us},
@@ -37,6 +40,7 @@ use {
         },
         sysvar_cache::SysvarCache,
     },
+    solana_rbpf::vm::Config,
     solana_runtime_transaction::instructions_processor::process_compute_budget_instructions,
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount, PROGRAM_OWNERS},
@@ -762,6 +766,116 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
     ) -> ExecutedTransaction {
         let transaction_accounts = std::mem::take(&mut loaded_transaction.accounts);
 
+        let twice = transaction_accounts
+            .iter()
+            .any(|(key, _)| solana_sdk::transaction_context::broken_direct_mapping().contains(key));
+
+        let dm = if twice {
+            let mut transaction_accounts = transaction_accounts.clone();
+
+            transaction_accounts.iter_mut().for_each(|(_, acc)| {
+                acc.data = Arc::new(acc.data().to_vec());
+            });
+
+            let mut execute_timings = execute_timings.clone();
+
+            let default_rent_collector = RentCollector::default();
+            let rent_collector = environment
+                .rent_collector
+                .unwrap_or(&default_rent_collector);
+
+            let compute_budget = config
+                .compute_budget
+                .unwrap_or_else(|| ComputeBudget::from(loaded_transaction.compute_budget_limits));
+
+            let mut transaction_context = TransactionContext::new(
+                transaction_accounts,
+                rent_collector.get_rent().clone(),
+                compute_budget.max_instruction_stack_depth,
+                compute_budget.max_instruction_trace_length,
+            );
+            #[cfg(debug_assertions)]
+            transaction_context.set_signature(tx.signature());
+
+            let log_collector = match config.log_messages_bytes_limit {
+                None => Some(LogCollector::new_ref()),
+                Some(log_messages_bytes_limit) => Some(LogCollector::new_ref_with_limit(Some(
+                    log_messages_bytes_limit,
+                ))),
+            };
+
+            let blockhash = environment.blockhash;
+            let lamports_per_signature = environment.lamports_per_signature;
+
+            let mut executed_units = 0u64;
+            let sysvar_cache = &self.sysvar_cache.read().unwrap();
+
+            let mut feature_set = (*environment.feature_set).clone();
+            feature_set.activate(&bpf_account_data_direct_mapping::id(), 0);
+
+            let config = Config {
+                max_call_depth: compute_budget.max_call_depth,
+                stack_frame_size: compute_budget.stack_frame_size,
+                enable_address_translation: true,
+                enable_stack_frame_gaps: !feature_set
+                    .is_active(&bpf_account_data_direct_mapping::id()),
+                instruction_meter_checkpoint_distance: 10000,
+                enable_instruction_meter: true,
+                enable_instruction_tracing: false,
+                enable_symbol_and_section_labels: false,
+                reject_broken_elfs: false,
+                noop_instruction_rate: 256,
+                sanitize_user_provided_values: true,
+                external_internal_function_hash_collision: feature_set
+                    .is_active(&error_on_syscall_bpf_function_hash_collisions::id()),
+                reject_callx_r10: feature_set.is_active(&reject_callx_r10::id()),
+                enable_sbpf_v1: true,
+                enable_sbpf_v2: false,
+                optimize_rodata: false,
+                aligned_memory_mapping: !feature_set
+                    .is_active(&bpf_account_data_direct_mapping::id()),
+                // Warning, do not use `Config::default()` so that configuration here is explicit.
+            };
+
+            let mut invoke_context = InvokeContext::new(
+                &mut transaction_context,
+                program_cache_for_tx_batch,
+                EnvironmentConfig::new(
+                    blockhash,
+                    environment.epoch_total_stake,
+                    environment.epoch_vote_accounts,
+                    Arc::new(feature_set),
+                    lamports_per_signature,
+                    sysvar_cache,
+                ),
+                log_collector.clone(),
+                compute_budget,
+            );
+
+            invoke_context.config = config;
+            invoke_context.direct_mapping = true;
+
+            let mut process_message_time = Measure::start("process_message_time");
+            let process_result = MessageProcessor::process_message(
+                tx,
+                &loaded_transaction.program_indices,
+                &mut invoke_context,
+                &mut execute_timings,
+                &mut executed_units,
+            );
+            process_message_time.stop();
+
+            let log_collector = invoke_context.get_log_collector().unwrap();
+
+            let logs = log_collector.borrow().messages.to_owned();
+
+            drop(invoke_context);
+
+            Some((transaction_context.accounts, logs, process_result))
+        } else {
+            None
+        };
+
         fn transaction_accounts_lamports_sum(
             accounts: &[(Pubkey, AccountSharedData)],
             message: &impl SVMMessage,
@@ -798,7 +912,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         let pre_account_state_info =
             TransactionAccountStateInfo::new(&transaction_context, tx, rent_collector);
 
-        let log_collector = if config.recording_config.enable_log_recording {
+        let log_collector = if dm.is_some() || config.recording_config.enable_log_recording {
             match config.log_messages_bytes_limit {
                 None => Some(LogCollector::new_ref()),
                 Some(log_messages_bytes_limit) => Some(LogCollector::new_ref_with_limit(Some(
@@ -830,6 +944,33 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             compute_budget,
         );
 
+        invoke_context.config = Config {
+            max_call_depth: compute_budget.max_call_depth,
+            stack_frame_size: compute_budget.stack_frame_size,
+            enable_address_translation: true,
+            enable_stack_frame_gaps: !environment
+                .feature_set
+                .is_active(&bpf_account_data_direct_mapping::id()),
+            instruction_meter_checkpoint_distance: 10000,
+            enable_instruction_meter: true,
+            enable_instruction_tracing: false,
+            enable_symbol_and_section_labels: false,
+            reject_broken_elfs: false,
+            noop_instruction_rate: 256,
+            sanitize_user_provided_values: true,
+            external_internal_function_hash_collision: environment
+                .feature_set
+                .is_active(&error_on_syscall_bpf_function_hash_collisions::id()),
+            reject_callx_r10: environment.feature_set.is_active(&reject_callx_r10::id()),
+            enable_sbpf_v1: true,
+            enable_sbpf_v2: false,
+            optimize_rodata: false,
+            aligned_memory_mapping: !environment
+                .feature_set
+                .is_active(&bpf_account_data_direct_mapping::id()),
+            // Warning, do not use `Config::default()` so that configuration here is explicit.
+        };
+
         let mut process_message_time = Measure::start("process_message_time");
         let process_result = MessageProcessor::process_message(
             tx,
@@ -841,6 +982,62 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         process_message_time.stop();
 
         drop(invoke_context);
+
+        let log_messages: Option<TransactionLogMessages> =
+            log_collector.and_then(|log_collector| {
+                Rc::try_unwrap(log_collector)
+                    .map(|log_collector| log_collector.into_inner().into_messages())
+                    .ok()
+            });
+
+        if let Some((dm_accounts, dm_logs, dm_result)) = dm {
+            let nada = Vec::new();
+            let logs = log_messages.as_ref().unwrap_or(&nada);
+
+            let logs_differ = logs.len() != dm_logs.len()
+                || logs
+                    .iter()
+                    .zip(dm_logs.iter())
+                    .any(|(dm, nondm)| dm != nondm);
+
+            let accounts_differ: Vec<_> = dm_accounts
+                .accounts
+                .iter()
+                .enumerate()
+                .zip(transaction_context.accounts.accounts.iter())
+                .filter_map(|((index, dm), nondm)| {
+                    let nondm = nondm.borrow();
+
+                    let dm = dm.borrow();
+                    if dm.data() != nondm.data()
+                        || dm.lamports() != nondm.lamports()
+                        || dm.owner() != nondm.owner()
+                    {
+                        Some(
+                            transaction_context
+                                .get_key_of_account_at_index(index as IndexOfAccount)
+                                .unwrap(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if logs_differ || dm_result != process_result {
+                println!(
+                    "XXX FOUND ONE signature:{} at:{}",
+                    tx.signature(),
+                    sysvar_cache.get_clock().unwrap().unix_timestamp
+                );
+
+                println!("LOGS DM:\n{dm_logs:?}\nresult:{dm_result:?}");
+                println!("LOGS non-DM:\n{logs:?}\nresult:{process_result:?}");
+                for i in accounts_differ {
+                    println!("ACCOUNT {i} DIFFERENT");
+                }
+            }
+        }
 
         saturating_add_assign!(
             execute_timings.execute_accessories.process_message_us,
@@ -875,12 +1072,12 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 err
             });
 
-        let log_messages: Option<TransactionLogMessages> =
-            log_collector.and_then(|log_collector| {
-                Rc::try_unwrap(log_collector)
-                    .map(|log_collector| log_collector.into_inner().into_messages())
-                    .ok()
-            });
+        // let log_messages: Option<TransactionLogMessages> =
+        //     log_collector.and_then(|log_collector| {
+        //         Rc::try_unwrap(log_collector)
+        //             .map(|log_collector| log_collector.into_inner().into_messages())
+        //             .ok()
+        //     });
 
         let inner_instructions = if config.recording_config.enable_cpi_recording {
             Some(Self::inner_instructions_list_from_instruction_trace(
