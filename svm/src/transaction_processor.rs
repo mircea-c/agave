@@ -770,7 +770,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             .iter()
             .any(|(key, _)| solana_sdk::transaction_context::broken_direct_mapping().contains(key));
 
-        let dm = if twice {
+        let dm = if true {
             let mut transaction_accounts = transaction_accounts.clone();
 
             transaction_accounts.iter_mut().for_each(|(_, acc)| {

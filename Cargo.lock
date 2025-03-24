@@ -6061,6 +6061,7 @@ dependencies = [
  "solana-feature-set",
  "solana-log-collector",
  "solana-measure",
+ "solana-metrics",
  "solana-poseidon",
  "solana-program-memory",
  "solana-program-runtime",

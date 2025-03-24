@@ -17,6 +17,7 @@ use {
         },
         transaction_context::BorrowedAccount,
     },
+    solana_metrics::*,
     std::{mem, ptr},
 };
 
@@ -1210,6 +1211,11 @@ fn update_callee_account(
     if direct_mapping {
         let prev_len = callee_account.get_data().len();
         let post_len = *caller_account.ref_to_len_in_vm.get()? as usize;
+        if post_len > prev_len {
+            datapoint_info!("cpi_stats", ("cpi_account_increase", 1, i64));
+        } else if post_len > prev_len {
+            datapoint_info!("cpi_stats", ("cpi_account_decrease", 1, i64));
+        }
         match callee_account
             .can_data_be_resized(post_len)
             .and_then(|_| callee_account.can_data_be_changed())
