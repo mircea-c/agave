@@ -1025,14 +1025,16 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 .collect();
 
             if logs_differ || dm_result != process_result {
-                println!(
+                let found = format!(
                     "XXX FOUND ONE signature:{} at:{}",
                     tx.signature(),
                     sysvar_cache.get_clock().unwrap().unix_timestamp
                 );
 
-                println!("LOGS DM:\n{dm_logs:?}\nresult:{dm_result:?}");
-                println!("LOGS non-DM:\n{logs:?}\nresult:{process_result:?}");
+                let logs_dm = format!("LOGS DM:\n{dm_logs:?}\nresult:{dm_result:?}");
+                let logs_nondm = format!("LOGS non-DM:\n{logs:?}\nresult:{process_result:?}");
+                let print_str = format!("{}\n{}\n{}", found, logs_dm, logs_nondm);
+                println!("{print_str}");
                 for i in accounts_differ {
                     println!("ACCOUNT {i} DIFFERENT");
                 }
