@@ -810,15 +810,22 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             let mut executed_units = 0u64;
             let sysvar_cache = &self.sysvar_cache.read().unwrap();
 
-            let mut feature_set = (*environment.feature_set).clone();
-            feature_set.activate(&bpf_account_data_direct_mapping::id(), 0);
+            // There are three variables with direct mapping:
+            // - (bpf_account_data_direct_mapping::id()) Direct mapping.
+            // - (enable_stack_frame_gaps) Stack frame gaps. This is independent of direct mapping.
+            // - (aligned_memory_mapping) Aligned memory mapping. This goes together with direct mapping.
+            let feature_set = (*environment.feature_set).clone();
+            // Only test disabling of stack frame gaps.
+            let enable_direct_mapping = false; // default.
+            let enable_stack_frame_gaps = false;
+            //feature_set.activate(&bpf_account_data_direct_mapping::id(), 0);
 
+            // Test with direct mapping enabled.
             let config = Config {
                 max_call_depth: compute_budget.max_call_depth,
                 stack_frame_size: compute_budget.stack_frame_size,
                 enable_address_translation: true,
-                enable_stack_frame_gaps: !feature_set
-                    .is_active(&bpf_account_data_direct_mapping::id()),
+                enable_stack_frame_gaps: enable_stack_frame_gaps,
                 instruction_meter_checkpoint_distance: 10000,
                 enable_instruction_meter: true,
                 enable_instruction_tracing: false,
@@ -832,8 +839,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 enable_sbpf_v1: true,
                 enable_sbpf_v2: false,
                 optimize_rodata: false,
-                aligned_memory_mapping: !feature_set
-                    .is_active(&bpf_account_data_direct_mapping::id()),
+                aligned_memory_mapping: !enable_direct_mapping,
                 // Warning, do not use `Config::default()` so that configuration here is explicit.
             };
 
@@ -853,7 +859,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             );
 
             invoke_context.config = config;
-            invoke_context.direct_mapping = true;
+            invoke_context.direct_mapping = enable_direct_mapping;
 
             let mut process_message_time = Measure::start("process_message_time");
             let process_result = MessageProcessor::process_message(
@@ -944,13 +950,16 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             compute_budget,
         );
 
+        // Only test disabling of stack frame gaps.
+        let enable_direct_mapping = false; // default.
+        let enable_stack_frame_gaps = true; // default.
+
+        // Test without direct mapping.
         invoke_context.config = Config {
             max_call_depth: compute_budget.max_call_depth,
             stack_frame_size: compute_budget.stack_frame_size,
             enable_address_translation: true,
-            enable_stack_frame_gaps: !environment
-                .feature_set
-                .is_active(&bpf_account_data_direct_mapping::id()),
+            enable_stack_frame_gaps: enable_stack_frame_gaps,
             instruction_meter_checkpoint_distance: 10000,
             enable_instruction_meter: true,
             enable_instruction_tracing: false,
@@ -965,9 +974,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             enable_sbpf_v1: true,
             enable_sbpf_v2: false,
             optimize_rodata: false,
-            aligned_memory_mapping: !environment
-                .feature_set
-                .is_active(&bpf_account_data_direct_mapping::id()),
+            aligned_memory_mapping: !enable_direct_mapping,
             // Warning, do not use `Config::default()` so that configuration here is explicit.
         };
 
