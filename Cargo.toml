@@ -353,7 +353,7 @@ rand_chacha0-2 = { package = "rand_chacha", version = "0.2.2" }
 rayon = "1.10.0"
 reed-solomon-erasure = "6.0.0"
 regex = "1.11.1"
-reqwest = { version = "0.12.15", default-features = false }
+reqwest = { version = "0.12.16", default-features = false }
 reqwest-middleware = "0.4.2"
 rolling-file = "0.2.0"
 rpassword = "7.4"
@@ -426,7 +426,7 @@ solana-decode-error = "2.2.1"
 solana-define-syscall = "2.3.0"
 solana-derivation-path = "2.2.1"
 solana-download-utils = { path = "download-utils", version = "=2.3.0" }
-solana-ed25519-program = "2.2.2"
+solana-ed25519-program = "2.2.3"
 solana-entry = { path = "entry", version = "=2.3.0" }
 solana-program-entrypoint = "2.2.1"
 solana-epoch-info = "2.2.1"
@@ -469,7 +469,7 @@ solana-log-collector = { path = "log-collector", version = "=2.3.0" }
 solana-logger = "2.3.1"
 solana-measure = { path = "measure", version = "=2.3.0" }
 solana-merkle-tree = { path = "merkle-tree", version = "=2.3.0" }
-solana-message = "2.3.0"
+solana-message = "2.4.0"
 solana-metrics = { path = "metrics", version = "=2.3.0" }
 solana-msg = "2.2.1"
 solana-native-token = "2.2.2"
@@ -530,9 +530,7 @@ solana-rpc-client-nonce-utils = { path = "rpc-client-nonce-utils", version = "=2
 solana-runtime = { path = "runtime", version = "=2.3.0" }
 solana-runtime-transaction = { path = "runtime-transaction", version = "=2.3.0" }
 solana-sbpf = "=0.11.1"
-solana-sdk = { version = "2.2.2", default-features = false }
 solana-sdk-ids = "2.2.1"
-solana-sdk-macro = "2.2.1"
 solana-secp256k1-program = "2.2.1"
 solana-secp256k1-recover = "2.2.1"
 solana-send-transaction-service = { path = "send-transaction-service", version = "=2.3.0" }
