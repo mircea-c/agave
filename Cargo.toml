@@ -1,8 +1,8 @@
 [profile.release-with-debug]
 inherits = "release"
 debug = true
-split-debuginfo = "packed"
-lto = false                # Preserve the 'thin local LTO' for this build.
+strip = false
+split-debuginfo = "off"
 
 [profile.release]
 split-debuginfo = "unpacked"
@@ -324,7 +324,7 @@ nix = "0.30.1"
 num-bigint = "0.4.6"
 num-derive = "0.4"
 num-traits = "0.2"
-num_cpus = "1.16.0"
+num_cpus = "1.17.0"
 num_enum = "0.7.3"
 openssl = "0.10"
 parking_lot = "0.12"
@@ -377,7 +377,7 @@ siphasher = "1.0.1"
 slab = "0.4.9"
 smallvec = "1.15.0"
 smpl_jwt = "0.7.1"
-socket2 = "0.5.9"
+socket2 = "0.5.10"
 soketto = "0.7"
 solana-account = "2.2.1"
 solana-account-decoder = { path = "account-decoder", version = "=2.3.0" }
@@ -439,7 +439,7 @@ solana-feature-gate-client = "0.0.2"
 solana-feature-gate-interface = "2.2.2"
 solana-fee-calculator = "2.2.1"
 solana-fee = { path = "fee", version = "=2.3.0" }
-solana-fee-structure = "2.2.1"
+solana-fee-structure = "2.3.0"
 solana-frozen-abi = "2.2.2"
 solana-frozen-abi-macro = "2.2.1"
 solana-tps-client = { path = "tps-client", version = "=2.3.0" }
@@ -453,7 +453,7 @@ solana-gossip = { path = "gossip", version = "=2.3.0" }
 solana-hard-forks = "2.2.1"
 solana-hash = "2.3.0"
 solana-inflation = "2.2.1"
-solana-instruction = "2.2.1"
+solana-instruction = "2.3.0"
 solana-instructions-sysvar = "2.2.2"
 solana-keccak-hasher = "2.2.1"
 solana-keypair = "2.2.1"
@@ -479,14 +479,12 @@ solana-nonce = "2.2.1"
 solana-nonce-account = "2.2.1"
 solana-notifier = { path = "notifier", version = "=2.3.0" }
 solana-offchain-message = "2.2.1"
-solana-package-metadata = "2.2.1"
-solana-package-metadata-macro = "2.2.1"
 solana-packet = "2.2.1"
 solana-perf = { path = "perf", version = "=2.3.0" }
 solana-poh = { path = "poh", version = "=2.3.0" }
 solana-poh-config = "2.2.1"
 solana-poseidon = { path = "poseidon", version = "=2.3.0" }
-solana-precompile-error = "2.2.1"
+solana-precompile-error = "2.2.2"
 solana-presigner = "2.2.1"
 solana-program = { version = "2.2.1", default-features = false }
 solana-program-error = "2.2.1"
@@ -506,7 +504,7 @@ solana-rent-collector = "2.2.1"
 solana-rent-debits = "2.2.1"
 solana-reward-info = "2.2.1"
 solana-sanitize = "2.2.1"
-solana-secp256r1-program = "2.2.2"
+solana-secp256r1-program = "2.2.3"
 solana-seed-derivable = "2.2.1"
 solana-seed-phrase = "2.2.1"
 solana-serde = "2.2.1"

@@ -64,6 +64,7 @@ use {
     ahash::{AHashSet, RandomState},
     dashmap::{DashMap, DashSet},
     log::*,
+    partitioned_epoch_rewards::PartitionedRewardsCalculation,
     rayon::{
         iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
         ThreadPoolBuilder,
@@ -334,6 +335,7 @@ pub struct TransactionSimulationResult {
     pub logs: TransactionLogMessages,
     pub post_simulation_accounts: Vec<TransactionAccount>,
     pub units_consumed: u64,
+    pub loaded_accounts_data_size: u32,
     pub return_data: Option<TransactionReturnData>,
     pub inner_instructions: Option<Vec<InnerInstructions>>,
 }
@@ -583,6 +585,7 @@ impl PartialEq for Bank {
             stats_for_accounts_lt_hash: _,
             block_id,
             bank_hash_stats: _,
+            epoch_rewards_calculation_cache: _,
             // Ignore new fields explicitly if they do not impact PartialEq.
             // Adding ".." will remove compile-time checks that if a new field
             // is added to the struct, this PartialEq is accordingly updated.
@@ -941,6 +944,11 @@ pub struct Bank {
 
     /// Accounts stats for computing the bank hash
     bank_hash_stats: AtomicBankHashStats,
+
+    /// The cache of epoch rewards calculation results
+    /// This is used to avoid recalculating the same epoch rewards at epoch boundary.
+    /// The hashmap is keyed by parent_hash.
+    epoch_rewards_calculation_cache: Arc<Mutex<HashMap<Hash, Arc<PartitionedRewardsCalculation>>>>,
 }
 
 #[derive(Debug)]
@@ -1140,6 +1148,7 @@ impl Bank {
             stats_for_accounts_lt_hash: AccountsLtHashStats::default(),
             block_id: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
+            epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
         };
 
         bank.transaction_processor =
@@ -1396,6 +1405,7 @@ impl Bank {
             stats_for_accounts_lt_hash: AccountsLtHashStats::default(),
             block_id: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::default(),
+            epoch_rewards_calculation_cache: parent.epoch_rewards_calculation_cache.clone(),
         };
 
         let (_, ancestors_time_us) = measure_us!({
@@ -1777,6 +1787,7 @@ impl Bank {
         additional_builtins: Option<&[BuiltinPrototype]>,
         debug_do_not_add_builtins: bool,
         accounts_data_size_initial: u64,
+        #[cfg(feature = "dev-context-only-utils")] feature_set: Option<FeatureSet>,
     ) -> Self {
         let now = Instant::now();
         let ancestors = Ancestors::from(&fields.ancestors);
@@ -1849,6 +1860,9 @@ impl Bank {
             transaction_log_collector_config: Arc::<RwLock<TransactionLogCollectorConfig>>::default(
             ),
             transaction_log_collector: Arc::<RwLock<TransactionLogCollector>>::default(),
+            #[cfg(feature = "dev-context-only-utils")]
+            feature_set: Arc::new(feature_set.unwrap_or_default()),
+            #[cfg(not(feature = "dev-context-only-utils"))]
             feature_set: Arc::<FeatureSet>::default(),
             reserved_account_keys: Arc::<ReservedAccountKeys>::default(),
             drop_callback: RwLock::new(OptionalDropCallback(None)),
@@ -1873,6 +1887,7 @@ impl Bank {
             stats_for_accounts_lt_hash: AccountsLtHashStats::default(),
             block_id: RwLock::new(None),
             bank_hash_stats: AtomicBankHashStats::new(&fields.bank_hash_stats),
+            epoch_rewards_calculation_cache: Arc::new(Mutex::new(HashMap::default())),
         };
 
         bank.transaction_processor =
@@ -2519,12 +2534,14 @@ impl Bank {
     fn update_reward_history(
         &self,
         stake_rewards: StakeRewards,
-        mut vote_rewards: Vec<(Pubkey, RewardInfo)>,
+        vote_rewards: &[(Pubkey, RewardInfo)],
     ) {
         let additional_reserve = stake_rewards.len() + vote_rewards.len();
         let mut rewards = self.rewards.write().unwrap();
         rewards.reserve(additional_reserve);
-        rewards.append(&mut vote_rewards);
+        vote_rewards.iter().for_each(|(vote_pubkey, vote_reward)| {
+            rewards.push((*vote_pubkey, *vote_reward));
+        });
         stake_rewards
             .into_iter()
             .filter(|x| x.get_stake_reward() > 0)
@@ -3127,11 +3144,6 @@ impl Bank {
         self.register_tick_for_test(&Hash::default())
     }
 
-    #[cfg(feature = "dev-context-only-utils")]
-    pub fn register_unique_tick(&self) {
-        self.register_tick_for_test(&Hash::new_unique())
-    }
-
     pub fn is_complete(&self) -> bool {
         self.tick_height() == self.max_tick_height()
     }
@@ -3172,53 +3184,77 @@ impl Bank {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let tx_account_lock_limit = self.get_transaction_account_lock_limit();
-        let lock_results = self
-            .rc
-            .accounts
-            .lock_accounts(sanitized_txs.iter(), tx_account_lock_limit);
         Ok(TransactionBatch::new(
-            lock_results,
+            self.try_lock_accounts(&sanitized_txs),
             self,
             OwnedOrBorrowed::Owned(sanitized_txs),
         ))
     }
 
     /// Attempt to take locks on the accounts in a transaction batch
-    pub fn try_lock_accounts(&self, txs: &[impl SVMMessage]) -> Vec<Result<()>> {
+    pub fn try_lock_accounts(&self, txs: &[impl TransactionWithMeta]) -> Vec<Result<()>> {
+        self.try_lock_accounts_with_results(txs, txs.iter().map(|_| Ok(())))
+    }
+
+    /// Attempt to take locks on the accounts in a transaction batch, and their cost
+    /// limited packing status and duplicate transaction conflict status
+    pub fn try_lock_accounts_with_results(
+        &self,
+        txs: &[impl TransactionWithMeta],
+        tx_results: impl Iterator<Item = Result<()>>,
+    ) -> Vec<Result<()>> {
         let tx_account_lock_limit = self.get_transaction_account_lock_limit();
-        self.rc
-            .accounts
-            .lock_accounts(txs.iter(), tx_account_lock_limit)
+        let relax_intrabatch_account_locks = self
+            .feature_set
+            .is_active(&feature_set::relax_intrabatch_account_locks::id());
+
+        // with simd83 enabled, we must fail transactions that duplicate a prior message hash
+        // previously, conflicting account locks would fail such transactions as a side effect
+        let mut batch_message_hashes = AHashSet::with_capacity(txs.len());
+        let tx_results = tx_results
+            .enumerate()
+            .map(|(i, tx_result)| match tx_result {
+                Ok(()) if relax_intrabatch_account_locks => {
+                    // `HashSet::insert()` returns `true` when the value does *not* already exist
+                    if batch_message_hashes.insert(txs[i].message_hash()) {
+                        Ok(())
+                    } else {
+                        Err(TransactionError::AlreadyProcessed)
+                    }
+                }
+                Ok(()) => Ok(()),
+                Err(e) => Err(e),
+            });
+
+        self.rc.accounts.lock_accounts(
+            txs.iter(),
+            tx_results,
+            tx_account_lock_limit,
+            relax_intrabatch_account_locks,
+        )
     }
 
     /// Prepare a locked transaction batch from a list of sanitized transactions.
-    pub fn prepare_sanitized_batch<'a, 'b, Tx: SVMMessage>(
+    pub fn prepare_sanitized_batch<'a, 'b, Tx: TransactionWithMeta>(
         &'a self,
         txs: &'b [Tx],
     ) -> TransactionBatch<'a, 'b, Tx> {
-        TransactionBatch::new(
-            self.try_lock_accounts(txs),
-            self,
-            OwnedOrBorrowed::Borrowed(txs),
-        )
+        self.prepare_sanitized_batch_with_results(txs, txs.iter().map(|_| Ok(())))
     }
 
     /// Prepare a locked transaction batch from a list of sanitized transactions, and their cost
     /// limited packing status
-    pub fn prepare_sanitized_batch_with_results<'a, 'b, Tx: SVMMessage>(
+    pub fn prepare_sanitized_batch_with_results<'a, 'b, Tx: TransactionWithMeta>(
         &'a self,
         transactions: &'b [Tx],
         transaction_results: impl Iterator<Item = Result<()>>,
     ) -> TransactionBatch<'a, 'b, Tx> {
         // this lock_results could be: Ok, AccountInUse, WouldExceedBlockMaxLimit or WouldExceedAccountMaxLimit
-        let tx_account_lock_limit = self.get_transaction_account_lock_limit();
-        let lock_results = self.rc.accounts.lock_accounts_with_results(
-            transactions.iter(),
-            transaction_results,
-            tx_account_lock_limit,
-        );
-        TransactionBatch::new(lock_results, self, OwnedOrBorrowed::Borrowed(transactions))
+        TransactionBatch::new(
+            self.try_lock_accounts_with_results(transactions, transaction_results),
+            self,
+            OwnedOrBorrowed::Borrowed(transactions),
+        )
     }
 
     /// Prepare a transaction batch from a single transaction without locking accounts
@@ -3238,7 +3274,7 @@ impl Bank {
     }
 
     /// Prepare a transaction batch from a single transaction after locking accounts
-    pub fn prepare_locked_batch_from_single_tx<'a, Tx: SVMMessage>(
+    pub fn prepare_locked_batch_from_single_tx<'a, Tx: TransactionWithMeta>(
         &'a self,
         transaction: &'a Tx,
     ) -> TransactionBatch<'a, 'a, Tx> {
@@ -3306,6 +3342,7 @@ impl Bank {
             return_data,
             inner_instructions,
             units_consumed,
+            loaded_accounts_data_size,
         ) = match processing_result {
             Ok(processed_tx) => match processed_tx {
                 ProcessedTransaction::Executed(executed_tx) => {
@@ -3323,13 +3360,20 @@ impl Bank {
                         details.return_data,
                         details.inner_instructions,
                         details.executed_units,
+                        executed_tx.loaded_transaction.loaded_accounts_data_size,
                     )
                 }
-                ProcessedTransaction::FeesOnly(fees_only_tx) => {
-                    (vec![], Err(fees_only_tx.load_error), None, None, None, 0)
-                }
+                ProcessedTransaction::FeesOnly(fees_only_tx) => (
+                    vec![],
+                    Err(fees_only_tx.load_error),
+                    None,
+                    None,
+                    None,
+                    0,
+                    fees_only_tx.rollback_accounts.data_size() as u32,
+                ),
             },
-            Err(error) => (vec![], Err(error), None, None, None, 0),
+            Err(error) => (vec![], Err(error), None, None, None, 0, 0),
         };
         let logs = logs.unwrap_or_default();
 
@@ -3338,6 +3382,7 @@ impl Bank {
             logs,
             post_simulation_accounts,
             units_consumed,
+            loaded_accounts_data_size,
             return_data,
             inner_instructions,
         }
@@ -6860,6 +6905,10 @@ impl Bank {
     pub fn get_bank_hash_stats(&self) -> BankHashStats {
         self.bank_hash_stats.load()
     }
+
+    pub fn clear_epoch_rewards_cache(&self) {
+        self.epoch_rewards_calculation_cache.lock().unwrap().clear();
+    }
 }
 
 impl InvokeContextCallback for Bank {
@@ -7082,16 +7131,15 @@ impl Bank {
         &self,
         txs: Vec<Transaction>,
     ) -> TransactionBatch<RuntimeTransaction<SanitizedTransaction>> {
-        let transaction_account_lock_limit = self.get_transaction_account_lock_limit();
         let sanitized_txs = txs
             .into_iter()
             .map(RuntimeTransaction::from_transaction_for_tests)
             .collect::<Vec<_>>();
-        let lock_results = self
-            .rc
-            .accounts
-            .lock_accounts(sanitized_txs.iter(), transaction_account_lock_limit);
-        TransactionBatch::new(lock_results, self, OwnedOrBorrowed::Owned(sanitized_txs))
+        TransactionBatch::new(
+            self.try_lock_accounts(&sanitized_txs),
+            self,
+            OwnedOrBorrowed::Owned(sanitized_txs),
+        )
     }
 
     /// Set the initial accounts data size

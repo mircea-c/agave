@@ -17,20 +17,18 @@ use {
     anyhow::Result,
     log::*,
     prost::Message,
+    solana_clock::{Epoch, Slot},
     solana_entry::entry::VerifyRecyclers,
     solana_gossip::{
         cluster_info::{ClusterInfo, GOSSIP_SLEEP_MILLIS},
         restart_crds_values::RestartLastVotedForkSlots,
     },
+    solana_hash::Hash,
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
         blockstore::Blockstore,
         blockstore_processor::{process_single_slot, ConfirmationProgress, ProcessOptions},
         leader_schedule_cache::LeaderScheduleCache,
-    },
-    solana_program::{
-        clock::{Epoch, Slot},
-        hash::Hash,
     },
     solana_pubkey::Pubkey,
     solana_runtime::{
@@ -191,7 +189,7 @@ impl std::error::Error for WenRestartError {}
 
 // We need a WenRestartProgressInternalState so we can convert the protobuf written in file
 // into internal data structure in the initialize function. It should be easily
-// convertable to and from WenRestartProgress protobuf.
+// convertible to and from WenRestartProgress protobuf.
 #[derive(Debug, PartialEq)]
 pub(crate) enum WenRestartProgressInternalState {
     Init {
@@ -663,7 +661,6 @@ pub(crate) fn find_bankhash_of_heaviest_fork(
                 &opts,
                 &recyclers,
                 &mut progress,
-                None,
                 None,
                 None,
                 None,
@@ -1443,16 +1440,13 @@ mod tests {
             crds_value::CrdsValue,
             restart_crds_values::{RestartHeaviestFork, RestartLastVotedForkSlots},
         },
+        solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::{create_new_ledger, entries_to_test_shreds, Blockstore},
             blockstore_options::LedgerColumnOptions,
             blockstore_processor::{fill_blockstore_slot_with_ticks, test_process_blockstore},
             get_tmp_ledger_path_auto_delete,
-        },
-        solana_program::{
-            hash::Hash,
-            vote::state::{TowerSync, Vote},
         },
         solana_pubkey::Pubkey,
         solana_runtime::{
@@ -1469,6 +1463,7 @@ mod tests {
         solana_streamer::socket::SocketAddrSpace,
         solana_time_utils::timestamp,
         solana_vote::vote_account::VoteAccount,
+        solana_vote_interface::state::{TowerSync, Vote},
         solana_vote_program::vote_state::create_account_with_authorized,
         std::{fs::remove_file, sync::Arc, thread::Builder},
         tempfile::TempDir,
@@ -2053,7 +2048,6 @@ mod tests {
             &opts,
             &recyclers,
             &mut progress,
-            None,
             None,
             None,
             None,

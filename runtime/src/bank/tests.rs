@@ -21,7 +21,9 @@ use {
         status_cache::MAX_CACHE_ENTRIES,
     },
     agave_feature_set::{self as feature_set, FeatureSet},
+    agave_reserved_account_keys::ReservedAccount,
     agave_transaction_view::static_account_keys_frame::MAX_STATIC_ACCOUNTS_PER_PACKET,
+    ahash::AHashMap,
     assert_matches::assert_matches,
     crossbeam_channel::{bounded, unbounded},
     ed25519_dalek::ed25519::signature::Signer as EdSigner,
@@ -3053,34 +3055,39 @@ fn test_debits_before_credits() {
     let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let keypair = Keypair::new();
     let tx0 = system_transaction::transfer(
-        &mint_keypair,
-        &keypair.pubkey(),
-        sol_to_lamports(2.),
-        genesis_config.hash(),
-    );
-    let tx1 = system_transaction::transfer(
         &keypair,
         &mint_keypair.pubkey(),
         sol_to_lamports(1.),
         genesis_config.hash(),
     );
+    let tx1 = system_transaction::transfer(
+        &mint_keypair,
+        &keypair.pubkey(),
+        sol_to_lamports(2.),
+        genesis_config.hash(),
+    );
     let txs = vec![tx0, tx1];
     let results = bank.process_transactions(txs.iter());
-    assert!(results[1].is_err());
+    assert!(results[0].is_err());
 
     // Assert bad transactions aren't counted.
     assert_eq!(bank.transaction_count(), 1);
     assert_eq!(bank.non_vote_transaction_count_since_restart(), 1);
 }
 
-#[test]
-fn test_readonly_accounts() {
+#[test_case(false; "old")]
+#[test_case(true; "simd83")]
+fn test_readonly_accounts(relax_intrabatch_account_locks: bool) {
     let GenesisConfigInfo {
         genesis_config,
         mint_keypair,
         ..
     } = create_genesis_config_with_leader(500, &solana_pubkey::new_rand(), 0);
-    let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    if !relax_intrabatch_account_locks {
+        bank.deactivate_feature(&feature_set::relax_intrabatch_account_locks::id());
+    }
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     let vote_pubkey0 = solana_pubkey::new_rand();
     let vote_pubkey1 = solana_pubkey::new_rand();
@@ -3144,9 +3151,16 @@ fn test_readonly_accounts() {
     );
     let txs = vec![tx0, tx1];
     let results = bank.process_transactions(txs.iter());
-    // However, an account may not be locked as read-only and writable at the same time.
+    // Whether an account can be locked as read-only and writable at the same time depends on features.
     assert_eq!(results[0], Ok(()));
-    assert_eq!(results[1], Err(TransactionError::AccountInUse));
+    assert_eq!(
+        results[1],
+        if relax_intrabatch_account_locks {
+            Ok(())
+        } else {
+            Err(TransactionError::AccountInUse)
+        }
+    );
 }
 
 #[test]
@@ -7178,11 +7192,15 @@ fn test_bank_load_program() {
 }
 
 #[allow(deprecated)]
-#[test]
-fn test_bpf_loader_upgradeable_deploy_with_max_len() {
+#[test_case(false; "informal_loaded_size")]
+#[test_case(true; "simd186_loaded_size")]
+fn test_bpf_loader_upgradeable_deploy_with_max_len(formalize_loaded_transaction_data_size: bool) {
     let (genesis_config, mint_keypair) = create_genesis_config_no_tx_fee(1_000_000_000);
     let mut bank = Bank::new_for_tests(&genesis_config);
     bank.feature_set = Arc::new(FeatureSet::all_enabled());
+    if !formalize_loaded_transaction_data_size {
+        bank.deactivate_feature(&feature_set::formalize_loaded_transaction_data_size::id());
+    }
     let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
     let mut bank_client = BankClient::new_shared(bank.clone());
 
@@ -8031,25 +8049,32 @@ fn test_compute_active_feature_set() {
 fn test_reserved_account_keys() {
     let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
     let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
-    bank.feature_set = Arc::new(FeatureSet::default());
+    let test_feature_id = Pubkey::new_unique();
+    bank.feature_set = Arc::new(FeatureSet::new(
+        AHashMap::new(),
+        AHashSet::from([test_feature_id]),
+    ));
+    bank.reserved_account_keys = Arc::new(ReservedAccountKeys::new(&[
+        ReservedAccount::new_active(system_program::id()),
+        ReservedAccount::new_pending(Pubkey::new_unique(), test_feature_id),
+    ]));
 
     assert_eq!(
         bank.get_reserved_account_keys().len(),
-        20,
-        "before activating the new feature, bank should already have active reserved keys"
+        1,
+        "before activating the test feature, bank should already have an active reserved key"
     );
 
-    // Activate `add_new_reserved_account_keys` feature
     bank.store_account(
-        &feature_set::add_new_reserved_account_keys::id(),
+        &test_feature_id,
         &feature::create_account(&Feature::default(), 42),
     );
     bank.apply_feature_activations(ApplyFeatureActivationsCaller::NewFromParent, true);
 
     assert_eq!(
         bank.get_reserved_account_keys().len(),
-        30,
-        "after activating the new feature, bank should have new active reserved keys"
+        2,
+        "after activating the test feature, bank should have another active reserved key"
     );
 }
 
@@ -8377,10 +8402,15 @@ fn test_timestamp_fast() {
     }
 }
 
-#[test]
-fn test_program_is_native_loader() {
+#[test_case(false; "informal_loaded_size")]
+#[test_case(true; "simd186_loaded_size")]
+fn test_program_is_native_loader(formalize_loaded_transaction_data_size: bool) {
     let (genesis_config, mint_keypair) = create_genesis_config(50000);
-    let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    if formalize_loaded_transaction_data_size {
+        bank.activate_feature(&feature_set::formalize_loaded_transaction_data_size::id());
+    }
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     let tx = Transaction::new_signed_with_payer(
         &[Instruction::new_with_bincode(
@@ -8392,20 +8422,29 @@ fn test_program_is_native_loader() {
         &[&mint_keypair],
         bank.last_blockhash(),
     );
-    assert_eq!(
-        bank.process_transaction(&tx),
-        Err(TransactionError::InstructionError(
-            0,
-            InstructionError::UnsupportedProgramId
-        ))
-    );
+
+    let err = bank.process_transaction(&tx).unwrap_err();
+    if formalize_loaded_transaction_data_size {
+        assert_eq!(err, TransactionError::ProgramAccountNotFound);
+    } else {
+        assert_eq!(
+            err,
+            TransactionError::InstructionError(0, InstructionError::UnsupportedProgramId)
+        );
+    }
 }
 
-#[test]
-fn test_invoke_non_program_account_owned_by_a_builtin() {
+#[test_case(false; "informal_loaded_size")]
+#[test_case(true; "simd186_loaded_size")]
+fn test_invoke_non_program_account_owned_by_a_builtin(
+    formalize_loaded_transaction_data_size: bool,
+) {
     let (genesis_config, mint_keypair) = create_genesis_config(10000000);
     let mut bank = Bank::new_for_tests(&genesis_config);
     bank.activate_feature(&feature_set::remove_accounts_executable_flag_checks::id());
+    if formalize_loaded_transaction_data_size {
+        bank.activate_feature(&feature_set::formalize_loaded_transaction_data_size::id());
+    }
     let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     let bogus_program = Pubkey::new_unique();
@@ -8432,13 +8471,12 @@ fn test_invoke_non_program_account_owned_by_a_builtin() {
         &[&mint_keypair, &created_account_keypair],
         bank.last_blockhash(),
     );
-    assert_eq!(
-        bank.process_transaction(&tx),
-        Err(TransactionError::InstructionError(
-            0,
-            InstructionError::UnsupportedProgramId
-        ))
-    );
+    let expected_error = if formalize_loaded_transaction_data_size {
+        TransactionError::InvalidProgramForExecution
+    } else {
+        TransactionError::InstructionError(0, InstructionError::UnsupportedProgramId)
+    };
+    assert_eq!(bank.process_transaction(&tx), Err(expected_error),);
 }
 
 #[test]
@@ -9429,8 +9467,9 @@ fn test_vote_epoch_panic() {
     );
 }
 
-#[test]
-fn test_tx_log_order() {
+#[test_case(false; "old")]
+#[test_case(true; "simd83")]
+fn test_tx_log_order(relax_intrabatch_account_locks: bool) {
     let GenesisConfigInfo {
         genesis_config,
         mint_keypair,
@@ -9440,7 +9479,11 @@ fn test_tx_log_order() {
         &Pubkey::new_unique(),
         bootstrap_validator_stake_lamports(),
     );
-    let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    if !relax_intrabatch_account_locks {
+        bank.deactivate_feature(&feature_set::relax_intrabatch_account_locks::id());
+    }
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
     *bank.transaction_log_collector_config.write().unwrap() = TransactionLogCollectorConfig {
         mentioned_addresses: HashSet::new(),
         filter: TransactionLogCollectorFilter::All,
@@ -9497,7 +9540,11 @@ fn test_tx_log_order() {
         .as_ref()
         .unwrap()[2]
         .contains(&"failed".to_string()));
-    assert!(commit_results[2].is_err());
+    if relax_intrabatch_account_locks {
+        assert!(commit_results[2].is_ok());
+    } else {
+        assert!(commit_results[2].is_err());
+    }
 
     let stored_logs = &bank.transaction_log_collector.read().unwrap().logs;
     let success_log_info = stored_logs
@@ -10570,8 +10617,9 @@ fn test_calculate_fee_secp256k1() {
     assert_eq!(calculate_test_fee(&message, 1, &fee_structure,), 11);
 }
 
-#[test]
-fn test_an_empty_instruction_without_program() {
+#[test_case(false; "informal_loaded_size")]
+#[test_case(true; "simd186_loaded_size")]
+fn test_an_empty_instruction_without_program(formalize_loaded_transaction_data_size: bool) {
     let (genesis_config, mint_keypair) = create_genesis_config_no_tx_fee_no_rent(1);
     let destination = solana_pubkey::new_rand();
     let mut ix = system_instruction::transfer(&mint_keypair.pubkey(), &destination, 0);
@@ -10579,11 +10627,21 @@ fn test_an_empty_instruction_without_program() {
     let message = Message::new(&[ix], Some(&mint_keypair.pubkey()));
     let tx = Transaction::new(&[&mint_keypair], message, genesis_config.hash());
 
-    let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
-    assert_eq!(
-        bank.process_transaction(&tx).unwrap_err(),
-        TransactionError::InstructionError(0, InstructionError::UnsupportedProgramId),
-    );
+    let mut bank = Bank::new_for_tests(&genesis_config);
+    if !formalize_loaded_transaction_data_size {
+        bank.deactivate_feature(&feature_set::formalize_loaded_transaction_data_size::id());
+    }
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+
+    let err = bank.process_transaction(&tx).unwrap_err();
+    if formalize_loaded_transaction_data_size {
+        assert_eq!(err, TransactionError::ProgramAccountNotFound);
+    } else {
+        assert_eq!(
+            err,
+            TransactionError::InstructionError(0, InstructionError::UnsupportedProgramId)
+        );
+    }
 }
 
 #[test]
@@ -12129,8 +12187,11 @@ fn test_is_in_slot_hashes_history() {
     assert!(!new_bank.is_in_slot_hashes_history(&0));
 }
 
-#[test]
-fn test_feature_activation_loaded_programs_cache_preparation_phase() {
+#[test_case(false; "informal_loaded_size")]
+#[test_case(true; "simd186_loaded_size")]
+fn test_feature_activation_loaded_programs_cache_preparation_phase(
+    formalize_loaded_transaction_data_size: bool,
+) {
     solana_logger::setup();
 
     // Bank Setup
@@ -12139,6 +12200,9 @@ fn test_feature_activation_loaded_programs_cache_preparation_phase() {
     let mut feature_set = FeatureSet::all_enabled();
     feature_set.deactivate(&feature_set::disable_sbpf_v0_execution::id());
     feature_set.deactivate(&feature_set::reenable_sbpf_v0_execution::id());
+    if !formalize_loaded_transaction_data_size {
+        feature_set.deactivate(&feature_set::formalize_loaded_transaction_data_size::id());
+    }
     bank.feature_set = Arc::new(feature_set);
     let (root_bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
@@ -13077,6 +13141,8 @@ fn test_failed_simulation_compute_units() {
     const TEST_UNITS: u64 = 10_000;
     const MOCK_BUILTIN_UNITS: u64 = 1;
     let expected_consumed_units = TEST_UNITS + MOCK_BUILTIN_UNITS;
+    let expected_loaded_program_account_data_size =
+        bank.get_account(&program_id).unwrap().data().len() as u32;
     declare_process_instruction!(MockBuiltin, MOCK_BUILTIN_UNITS, |invoke_context| {
         invoke_context.consume_checked(TEST_UNITS).unwrap();
         Err(InstructionError::InvalidInstructionData)
@@ -13092,6 +13158,10 @@ fn test_failed_simulation_compute_units() {
     let sanitized = RuntimeTransaction::from_transaction_for_tests(transaction);
     let simulation = bank.simulate_transaction(&sanitized, false);
     assert_eq!(expected_consumed_units, simulation.units_consumed);
+    assert_eq!(
+        expected_loaded_program_account_data_size,
+        simulation.loaded_accounts_data_size
+    );
 }
 
 /// Test that simulations report the load error of fees-only transactions
@@ -13121,6 +13191,7 @@ fn test_failed_simulation_load_error() {
             logs: vec![],
             post_simulation_accounts: vec![],
             units_consumed: 0,
+            loaded_accounts_data_size: 0,
             return_data: None,
             inner_instructions: None,
         }
@@ -13288,8 +13359,9 @@ fn test_deploy_last_epoch_slot() {
     assert_eq!(result_with_feature_enabled, Ok(()));
 }
 
-#[test]
-fn test_loader_v3_to_v4_migration() {
+#[test_case(false; "informal_loaded_size")]
+#[test_case(true; "simd186_loaded_size")]
+fn test_loader_v3_to_v4_migration(formalize_loaded_transaction_data_size: bool) {
     solana_logger::setup();
 
     // Bank Setup
@@ -13300,6 +13372,9 @@ fn test_loader_v3_to_v4_migration() {
     );
     let mut bank = Bank::new_for_tests(&genesis_config);
     bank.activate_feature(&feature_set::remove_accounts_executable_flag_checks::id());
+    if formalize_loaded_transaction_data_size {
+        bank.activate_feature(&feature_set::formalize_loaded_transaction_data_size::id());
+    }
     let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
     let fee_calculator = genesis_config.fee_rate_governor.create_fee_calculator();
     let mut next_slot = 1;

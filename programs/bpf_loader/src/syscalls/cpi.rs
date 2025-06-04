@@ -9,25 +9,10 @@ use {
     solana_transaction_context::BorrowedAccount,
     std::{mem, ptr},
 };
-// consts inlined to avoid solana-program dep
+
 const MAX_CPI_INSTRUCTION_DATA_LEN: u64 = 10 * 1024;
-#[cfg(test)]
-static_assertions::const_assert_eq!(
-    MAX_CPI_INSTRUCTION_DATA_LEN,
-    solana_program::syscalls::MAX_CPI_INSTRUCTION_DATA_LEN
-);
 const MAX_CPI_INSTRUCTION_ACCOUNTS: u8 = u8::MAX;
-#[cfg(test)]
-static_assertions::const_assert_eq!(
-    MAX_CPI_INSTRUCTION_ACCOUNTS,
-    solana_program::syscalls::MAX_CPI_INSTRUCTION_ACCOUNTS
-);
 const MAX_CPI_ACCOUNT_INFOS: usize = 128;
-#[cfg(test)]
-static_assertions::const_assert_eq!(
-    MAX_CPI_ACCOUNT_INFOS,
-    solana_program::syscalls::MAX_CPI_ACCOUNT_INFOS
-);
 
 fn check_account_info_pointer(
     invoke_context: &InvokeContext,
@@ -168,8 +153,7 @@ impl<'a> CallerAccount<'a> {
                     return Err(SyscallError::InvalidPointer.into());
                 }
             }
-            let host_len_addr =
-                translate(memory_mapping, AccessType::Store, vm_len_addr, 8)? as *mut u64;
+            let ref_to_len_in_vm = translate_type_mut::<u64>(memory_mapping, vm_len_addr, false)?;
             let vm_data_addr = data.as_ptr() as u64;
 
             let serialized_data = if direct_mapping {
@@ -194,9 +178,7 @@ impl<'a> CallerAccount<'a> {
                     invoke_context.get_check_aligned(),
                 )?
             };
-            (serialized_data, vm_data_addr, unsafe {
-                &mut *host_len_addr
-            })
+            (serialized_data, vm_data_addr, ref_to_len_in_vm)
         };
 
         Ok(CallerAccount {
@@ -291,12 +273,7 @@ impl<'a> CallerAccount<'a> {
         let vm_len_addr = vm_addr
             .saturating_add(&account_info.data_len as *const u64 as u64)
             .saturating_sub(account_info as *const _ as *const u64 as u64);
-        let host_len_addr = translate(
-            memory_mapping,
-            AccessType::Store,
-            vm_len_addr,
-            size_of::<u64>() as u64,
-        )?;
+        let ref_to_len_in_vm = translate_type_mut::<u64>(memory_mapping, vm_len_addr, false)?;
 
         Ok(CallerAccount {
             lamports,
@@ -304,7 +281,7 @@ impl<'a> CallerAccount<'a> {
             original_data_len: account_metadata.original_data_len,
             serialized_data,
             vm_data_addr: account_info.data_addr,
-            ref_to_len_in_vm: unsafe { &mut *(host_len_addr as *mut u64) },
+            ref_to_len_in_vm,
         })
     }
 
@@ -467,7 +444,7 @@ impl SyscallInvokeSigned for SyscallInvokeSignedRust {
     ) -> Result<Vec<Pubkey>, Error> {
         let mut signers = Vec::new();
         if signers_seeds_len > 0 {
-            let signers_seeds = translate_slice_of_slices::<VmSlice<u8>>(
+            let signers_seeds = translate_slice::<VmSlice<VmSlice<u8>>>(
                 memory_mapping,
                 signers_seeds_addr,
                 signers_seeds_len,
@@ -477,7 +454,7 @@ impl SyscallInvokeSigned for SyscallInvokeSignedRust {
                 return Err(Box::new(SyscallError::TooManySigners));
             }
             for signer_seeds in signers_seeds.iter() {
-                let untranslated_seeds = translate_slice_of_slices::<u8>(
+                let untranslated_seeds = translate_slice::<VmSlice<u8>>(
                     memory_mapping,
                     signer_seeds.ptr(),
                     signer_seeds.len(),

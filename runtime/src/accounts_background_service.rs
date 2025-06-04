@@ -26,10 +26,11 @@ use {
     stats::StatsManager,
     std::{
         boxed::Box,
-        fmt::{Debug, Formatter},
+        cmp,
+        fmt::{self, Debug, Formatter},
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, RwLock,
+            Arc, LazyLock, RwLock,
         },
         thread::{self, sleep, Builder, JoinHandle},
         time::{Duration, Instant},
@@ -37,7 +38,7 @@ use {
 };
 
 const INTERVAL_MS: u64 = 100;
-const CLEAN_INTERVAL_BLOCKS: u64 = 100;
+const CLEAN_INTERVAL_SLOTS: Slot = 100;
 const SHRINK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type SnapshotRequestSender = Sender<SnapshotRequest>;
@@ -68,8 +69,8 @@ impl PrunedBankQueueLenReporter {
     }
 }
 
-static BANK_DROP_QUEUE_REPORTER: std::sync::LazyLock<PrunedBankQueueLenReporter> =
-    std::sync::LazyLock::new(PrunedBankQueueLenReporter::default);
+static BANK_DROP_QUEUE_REPORTER: LazyLock<PrunedBankQueueLenReporter> =
+    LazyLock::new(PrunedBankQueueLenReporter::default);
 
 #[derive(Clone)]
 pub struct SendDroppedBankCallback {
@@ -90,7 +91,7 @@ impl DropCallback for SendDroppedBankCallback {
 }
 
 impl Debug for SendDroppedBankCallback {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "SendDroppedBankCallback({self:p})")
     }
 }
@@ -112,7 +113,7 @@ pub struct SnapshotRequest {
 }
 
 impl Debug for SnapshotRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SnapshotRequest")
             .field("request kind", &self.request_kind)
             .field("bank slot", &self.snapshot_root_bank.slot())
@@ -147,7 +148,7 @@ impl SnapshotRequestHandler {
         test_hash_calculation: bool,
         non_snapshot_time_us: u128,
         exit: &AtomicBool,
-    ) -> Option<Result<u64, SnapshotError>> {
+    ) -> Option<Result<Slot, SnapshotError>> {
         let (snapshot_request, num_outstanding_requests, num_re_enqueued_requests) =
             self.get_next_snapshot_request()?;
 
@@ -272,7 +273,7 @@ impl SnapshotRequestHandler {
         snapshot_request: SnapshotRequest,
         accounts_package_kind: AccountsPackageKind,
         exit: &AtomicBool,
-    ) -> Result<u64, SnapshotError> {
+    ) -> Result<Slot, SnapshotError> {
         info!("handling snapshot request: {snapshot_request:?}, {accounts_package_kind:?}");
         let mut total_time = Measure::start("snapshot_request_receiver_total_time");
         let SnapshotRequest {
@@ -413,7 +414,7 @@ impl SnapshotRequestHandler {
             ("non_snapshot_time_us", non_snapshot_time_us, i64),
             ("shrink_ancient_time_us", shrink_ancient_time_us, i64),
         );
-        Ok(snapshot_root_bank.block_height())
+        Ok(snapshot_root_bank.slot())
     }
 }
 
@@ -496,7 +497,7 @@ impl AbsRequestHandlers {
         test_hash_calculation: bool,
         non_snapshot_time_us: u128,
         exit: &AtomicBool,
-    ) -> Option<Result<u64, SnapshotError>> {
+    ) -> Option<Result<Slot, SnapshotError>> {
         self.snapshot_request_handler.handle_snapshot_requests(
             test_hash_calculation,
             non_snapshot_time_us,
@@ -519,7 +520,7 @@ impl AccountsBackgroundService {
     ) -> Self {
         let is_running = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
-        let mut last_cleaned_block_height = 0;
+        let mut last_cleaned_slot = 0;
         let mut removed_slots_count = 0;
         let mut total_remove_slots_time = 0;
         let t_background = Builder::new()
@@ -598,21 +599,34 @@ impl AccountsBackgroundService {
 
                             last_snapshot_end_time = Some(Instant::now());
                             match snapshot_handle_result {
-                                Ok(snapshot_block_height) => {
-                                    assert!(last_cleaned_block_height <= snapshot_block_height);
-                                    last_cleaned_block_height = snapshot_block_height;
+                                Ok(snapshot_slot) => {
+                                    assert!(
+                                        last_cleaned_slot <= snapshot_slot,
+                                        "last cleaned slot: {last_cleaned_slot}, \
+                                         snapshot request slot: {snapshot_slot}, \
+                                         is startup verification complete: {}, \
+                                         enqueued snapshot requests: {:?}",
+                                        bank.is_startup_verification_complete(),
+                                        request_handlers
+                                            .snapshot_request_handler
+                                            .snapshot_request_receiver
+                                            .try_iter()
+                                            .collect::<Vec<_>>(),
+                                    );
+                                    last_cleaned_slot = snapshot_slot;
+                                    previous_shrink_time = Instant::now();
                                 }
                                 Err(err) => {
                                     error!(
                                         "Stopping AccountsBackgroundService! \
-                                        Fatal error while handling snapshot requests: {err}",
+                                         Fatal error while handling snapshot requests: {err}",
                                     );
                                     exit.store(true, Ordering::Relaxed);
                                     break;
                                 }
                             }
-                        } else if bank.block_height() - last_cleaned_block_height
-                            > (CLEAN_INTERVAL_BLOCKS + thread_rng().gen_range(0..10))
+                        } else if bank.slot() - last_cleaned_slot
+                            > (CLEAN_INTERVAL_SLOTS + thread_rng().gen_range(0..10))
                         {
                             // Note that the flush will do an internal clean of the
                             // cache up to bank.slot(), so should be safe as long
@@ -620,32 +634,20 @@ impl AccountsBackgroundService {
                             // slots >= bank.slot()
                             bank.force_flush_accounts_cache();
                             bank.clean_accounts();
-                            last_cleaned_block_height = bank.block_height();
-                            // Do not 'shrink' until *after* the startup verification is complete.
-                            // This is because startup verification needs to get the snapshot
-                            // storages *as they existed at startup* (to calculate the accounts
-                            // hash).  If 'shrink' were to run, then it is possible startup
-                            // verification (1) could race with 'shrink', and fail to assert that
-                            // shrinking is not in progress, or (2) could get snapshot storages
-                            // that were newer than what was in the snapshot itself.
-                            if bank.is_startup_verification_complete() {
-                                bank.shrink_ancient_slots();
-                                bank.shrink_candidate_slots();
-                            }
+                            last_cleaned_slot = bank.slot();
+                            bank.shrink_ancient_slots();
+                            bank.shrink_candidate_slots();
+                            previous_shrink_time = Instant::now();
                         } else {
                             // Note that the flush will do an internal clean of the
                             // cache up to bank.slot(), so should be safe as long
                             // as any later snapshots that are taken are of
                             // slots >= bank.slot()
                             bank.flush_accounts_cache_if_needed();
-
-                            // See justification above for why we skip 'shrink' here.
-                            if bank.is_startup_verification_complete() {
-                                let duration_since_previous_shrink = previous_shrink_time.elapsed();
-                                if duration_since_previous_shrink > SHRINK_INTERVAL {
-                                    previous_shrink_time = Instant::now();
-                                    bank.shrink_candidate_slots();
-                                }
+                            let duration_since_previous_shrink = previous_shrink_time.elapsed();
+                            if duration_since_previous_shrink > SHRINK_INTERVAL {
+                                bank.shrink_candidate_slots();
+                                previous_shrink_time = Instant::now();
                             }
                         }
                         stats.record_and_maybe_submit(start_time.elapsed());
@@ -765,7 +767,7 @@ fn new_accounts_package_kind(snapshot_request: &SnapshotRequest) -> Option<Accou
 ///
 /// If two requests of the same kind are being compared, their bank slots are the tiebreaker.
 #[must_use]
-fn cmp_requests_by_priority(a: &SnapshotRequest, b: &SnapshotRequest) -> std::cmp::Ordering {
+fn cmp_requests_by_priority(a: &SnapshotRequest, b: &SnapshotRequest) -> cmp::Ordering {
     let slot_a = a.snapshot_root_bank.slot();
     let slot_b = b.snapshot_root_bank.slot();
     cmp_snapshot_request_kinds_by_priority(&a.request_kind, &b.request_kind)
@@ -782,9 +784,9 @@ fn cmp_requests_by_priority(a: &SnapshotRequest, b: &SnapshotRequest) -> std::cm
 fn cmp_snapshot_request_kinds_by_priority(
     a: &SnapshotRequestKind,
     b: &SnapshotRequestKind,
-) -> std::cmp::Ordering {
+) -> cmp::Ordering {
     use {
-        std::cmp::Ordering::{Equal, Greater, Less},
+        cmp::Ordering::{Equal, Greater, Less},
         SnapshotRequestKind as Kind,
     };
     match (a, b) {
@@ -1122,7 +1124,7 @@ mod test {
 
     #[test]
     fn test_cmp_snapshot_request_kinds_by_priority() {
-        use std::cmp::Ordering::{Equal, Greater, Less};
+        use cmp::Ordering::{Equal, Greater, Less};
         for (snapshot_request_kind_a, snapshot_request_kind_b, expected_result) in [
             (
                 SnapshotRequestKind::EpochAccountsHash,

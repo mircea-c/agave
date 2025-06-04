@@ -45,6 +45,7 @@ use {
     solana_feature_gate_interface::{self as feature, Feature},
     solana_genesis_config::ClusterType,
     solana_inflation::Inflation,
+    solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
     solana_ledger::{
         blockstore::{banking_trace_path, create_new_ledger, Blockstore},
         blockstore_options::{AccessType, LedgerColumnOptions},
@@ -754,7 +755,13 @@ fn record_transactions(
                     let instructions = message
                         .instructions()
                         .iter()
-                        .map(|ix| parse_ui_instruction(ix, &message.account_keys(), None))
+                        .map(|ix| {
+                            parse_ui_instruction(
+                                ix,
+                                &message.account_keys(),
+                                Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32),
+                            )
+                        })
                         .collect();
 
                     let is_simple_vote_tx = tx.is_simple_vote_transaction();
@@ -2331,9 +2338,7 @@ fn main() {
                     }
 
                     if child_bank_required {
-                        while !bank.is_complete() {
-                            bank.register_unique_tick();
-                        }
+                        bank.fill_bank_with_ticks_for_tests();
                     }
 
                     let pre_capitalization = bank.capitalization();
