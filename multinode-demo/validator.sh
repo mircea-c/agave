@@ -340,14 +340,19 @@ setup_validator_accounts() {
             transfer --allow-unfunded-recipient "$identity" "$stake_sol"
         ) || return $?
       fi
+      # Stake instructions are rejected while partitioned epoch rewards are
+      # being distributed
+      wait_for_epoch_rewards_inactive "$rpc_url" 30 2
+
       echo "Creating stake account"
-      # in case partitioned epoch rewards distribution is active. retry the command to add more tlorercnce
-      retry_command 10 2 \
+      retry_while_epoch_rewards_active 10 2 \
         wallet create-stake-account "$stake_account" "$stake_sol" || return $?
+
       echo "Delegating stake"
       declare vote_pubkey
       vote_pubkey=$($solana_keygen pubkey "$vote_account") || return $?
-      wallet delegate-stake "$stake_account" "$vote_pubkey" || return $?
+      retry_while_epoch_rewards_active 10 2 \
+        wallet delegate-stake "$stake_account" "$vote_pubkey" || return $?
     fi
   fi
   echo "Validator vote account configured"
