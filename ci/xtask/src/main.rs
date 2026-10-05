@@ -39,6 +39,8 @@ enum Commands {
     ConformanceTable(commands::conformance_table::CommandArgs),
     #[command(about = "Check the workspace against a release profile")]
     ReleaseCheck(commands::release_check::CommandArgs),
+    #[command(about = "Build and install the Agave release binaries")]
+    InstallAll(commands::install_all::CommandArgs),
 }
 
 #[derive(Args, Debug)]
@@ -101,6 +103,9 @@ async fn try_main(xtask: Xtask) -> Result<()> {
         }
         Commands::ReleaseCheck(args) => {
             commands::release_check::run(args)?;
+        }
+        Commands::InstallAll(args) => {
+            commands::install_all::run(args)?;
         }
     }
 

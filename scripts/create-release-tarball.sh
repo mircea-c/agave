@@ -105,7 +105,7 @@ EOF
 
 source ci/rust-version.sh stable
 
-scripts/cargo-install-all.sh stable "${build_dir}"
+scripts/cargo-install-all.sh "${build_dir}"
 
 source scripts/agave-build-lists.sh
 
