@@ -1,8 +1,8 @@
 use {
+    super::install_all::{Profile, Scope, Selection, bin_build_args, parse_build_lists},
     anyhow::{Context, Result, bail, ensure},
     clap::Args,
     log::info,
-    serde::Deserialize,
     std::{
         env, fs,
         path::{Path, PathBuf},
@@ -10,40 +10,15 @@ use {
     },
 };
 
-#[derive(Deserialize)]
-struct CargoManifest {
-    workspace: Workspace,
-}
-
-#[derive(Deserialize)]
-struct Workspace {
-    metadata: Metadata,
-}
-
-#[derive(Deserialize)]
-struct Metadata {
-    #[serde(rename = "agave-build-lists")]
-    build_lists: BuildLists,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct BuildLists {
-    dev: Vec<String>,
-    end_user: Vec<String>,
-    val_op: Vec<String>,
-    dcou: Vec<String>,
-    deprecated: Vec<String>,
-}
-
 #[derive(Args)]
 pub struct CommandArgs {
     #[arg(
         long,
+        value_enum,
         default_value = "release",
         help = "Cargo profile to check against"
     )]
-    pub profile: String,
+    pub profile: Profile,
 
     #[arg(long, help = "Override the computed job count")]
     pub jobs: Option<usize>,
@@ -61,39 +36,32 @@ pub fn run(args: CommandArgs) -> Result<()> {
         fs::read_to_string(repo_root.join("Cargo.toml")).context("failed to read Cargo.toml")?;
     let (prod_bins, dcou_bins) = bin_sets(&manifest)?;
 
-    // Mirrors the two builds in scripts/cargo-install-all.sh: dcou bins live in
-    // dev-bins so their features do not unify with the production bins.
-    info!("checking {profile} production bins across {jobs} jobs: {prod_bins:?}");
-    cargo_check(&repo_root, &profile, jobs, &["--workspace"], &prod_bins)?;
-
-    info!("checking {profile} dcou bins across {jobs} jobs: {dcou_bins:?}");
+    // Same arguments as the two builds in `cargo xtask install-all`
+    let profile_name = profile.name();
+    info!("checking {profile_name} production bins across {jobs} jobs: {prod_bins:?}");
     cargo_check(
         &repo_root,
-        &profile,
         jobs,
-        &["--manifest-path", "dev-bins/Cargo.toml"],
-        &dcou_bins,
+        &bin_build_args(profile, Scope::Workspace, &prod_bins),
+    )?;
+
+    info!("checking {profile_name} dcou bins across {jobs} jobs: {dcou_bins:?}");
+    cargo_check(
+        &repo_root,
+        jobs,
+        &bin_build_args(profile, Scope::DevBins, &dcou_bins),
     )?;
 
     Ok(())
 }
 
-fn cargo_check(
-    repo_root: &Path,
-    profile: &str,
-    jobs: usize,
-    scope: &[&str],
-    bins: &[String],
-) -> Result<()> {
+fn cargo_check(repo_root: &Path, jobs: usize, build_args: &[String]) -> Result<()> {
     // RUSTFLAGS stays unset so .cargo/config.toml keeps -Ctarget-cpu.
     let mut cmd = Command::new(cargo_bin());
     cmd.current_dir(repo_root)
-        .args(["check", "--profile", profile])
-        .args(scope)
+        .arg("check")
+        .args(build_args)
         .args(["--jobs", &jobs.to_string()]);
-    for bin in bins {
-        cmd.args(["--bin", bin]);
-    }
 
     let status = cmd.status().context("failed to run cargo check")?;
     if !status.success() {
@@ -103,24 +71,14 @@ fn cargo_check(
     Ok(())
 }
 
-/// Production and dcou bins, grouped the same way scripts/cargo-install-all.sh
+/// Production and dcou bins, grouped the same way `cargo xtask install-all`
 /// builds them.
 fn bin_sets(manifest: &str) -> Result<(Vec<String>, Vec<String>)> {
-    let manifest: CargoManifest = toml::from_str(manifest)
-        .context("failed to parse [workspace.metadata.agave-build-lists] in Cargo.toml")?;
-    let BuildLists {
-        dev,
-        end_user,
-        val_op,
-        dcou,
-        deprecated,
-    } = manifest.workspace.metadata.build_lists;
-
-    let prod_bins: Vec<String> = [deprecated, dev, end_user, val_op].concat();
+    let (prod_bins, dcou_bins) = Selection::all().bins(parse_build_lists(manifest)?);
     ensure!(!prod_bins.is_empty(), "no production bins in Cargo.toml");
-    ensure!(!dcou.is_empty(), "no dcou bins in Cargo.toml");
+    ensure!(!dcou_bins.is_empty(), "no dcou bins in Cargo.toml");
 
-    Ok((prod_bins, dcou))
+    Ok((prod_bins, dcou_bins))
 }
 
 fn cargo_bin() -> PathBuf {

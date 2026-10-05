@@ -1,6 +1,6 @@
 use {
     anyhow::{Context, Result, bail},
-    clap::{ArgGroup, Args},
+    clap::{ArgGroup, Args, ValueEnum},
     log::{info, warn},
     serde::Deserialize,
     std::{
@@ -29,7 +29,7 @@ struct Metadata {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
-struct BuildLists {
+pub struct BuildLists {
     dev: Vec<String>,
     end_user: Vec<String>,
     val_op: Vec<String>,
@@ -102,7 +102,7 @@ pub struct CommandArgs {
     pub validator_only: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Profile {
     Debug,
     Release,
@@ -170,7 +170,7 @@ pub fn bin_build_args(profile: Profile, scope: Scope, bins: &[String]) -> Vec<St
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Selection {
+pub struct Selection {
     dcou: bool,
     deprecated: bool,
     dev: bool,
@@ -179,6 +179,16 @@ struct Selection {
 }
 
 impl Selection {
+    pub fn all() -> Self {
+        Self {
+            dcou: true,
+            deprecated: true,
+            dev: true,
+            end_user: true,
+            validator: true,
+        }
+    }
+
     fn from_args(args: &CommandArgs) -> Self {
         // dcou and validator bins are not built on Windows
         let windows = cfg!(windows);
@@ -191,7 +201,7 @@ impl Selection {
         }
     }
 
-    fn bins(&self, lists: BuildLists) -> (Vec<String>, Vec<String>) {
+    pub fn bins(&self, lists: BuildLists) -> (Vec<String>, Vec<String>) {
         let BuildLists {
             dev,
             end_user,
@@ -346,7 +356,7 @@ fn unit_graph_activates_dcou(unit_graph: &[u8]) -> Result<bool> {
         .any(|unit| unit.features.iter().any(|f| f == "dev-context-only-utils")))
 }
 
-fn parse_build_lists(manifest: &str) -> Result<BuildLists> {
+pub fn parse_build_lists(manifest: &str) -> Result<BuildLists> {
     let manifest: CargoManifest = toml::from_str(manifest)
         .context("failed to parse [workspace.metadata.agave-build-lists] in Cargo.toml")?;
     Ok(manifest.workspace.metadata.build_lists)
@@ -589,19 +599,9 @@ mod tests {
         }
     }
 
-    fn all() -> Selection {
-        Selection {
-            dcou: true,
-            deprecated: true,
-            dev: true,
-            end_user: true,
-            validator: true,
-        }
-    }
-
     #[test]
     fn selects_bins_in_script_order() {
-        let (prod_bins, dcou_bins) = all().bins(lists());
+        let (prod_bins, dcou_bins) = Selection::all().bins(lists());
 
         assert_eq!(
             prod_bins,
@@ -616,7 +616,7 @@ mod tests {
             dev: false,
             deprecated: false,
             dcou: false,
-            ..all()
+            ..Selection::all()
         };
         let (prod_bins, dcou_bins) = selection.bins(lists());
 
@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn reads_repo_manifest() {
         let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).unwrap();
-        let (prod_bins, dcou_bins) = all().bins(parse_build_lists(&manifest).unwrap());
+        let (prod_bins, dcou_bins) = Selection::all().bins(parse_build_lists(&manifest).unwrap());
 
         assert!(prod_bins.iter().any(|bin| bin == "agave-validator"));
         assert!(dcou_bins.iter().any(|bin| bin == "agave-ledger-tool"));
