@@ -23,7 +23,7 @@ use {
     solana_perf::{
         self,
         deduper::Deduper,
-        packet::{PacketBatch, PacketRef, PacketRefMut},
+        packet::{BytesPacket, PacketBatch},
     },
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -184,18 +184,20 @@ fn run_shred_sigverify<const K: usize>(
     // path once a shred is repaired.
     // For backward compatibility we need to allow trailing bytes in the packet
     // after the shred payload, but have to exclude them here from the deduper.
+    // The retransmitter signature is hop-specific, so it is also excluded from
+    // the deduper.
     stats.num_duplicates += thread_pool.install(|| {
         shred_buffer
             .par_iter_mut()
             .flatten()
             .filter(|packet| {
                 !packet.meta().discard()
-                    && shred::wire::get_shred(packet.as_ref())
+                    && shred::wire::get_shred_without_retransmitter_signature(packet)
                         .map(|shred| deduper.dedup(shred))
                         .unwrap_or(true)
                     && !packet.meta().repair()
             })
-            .map(|mut packet| packet.meta_mut().set_discard(true))
+            .map(|packet| packet.meta_mut().set_discard(true))
             .count()
     });
     let (working_bank, root_bank) = {
@@ -220,9 +222,9 @@ fn run_shred_sigverify<const K: usize>(
             .par_iter_mut()
             .flatten()
             .filter(|packet| !packet.meta().discard())
-            .for_each(|mut packet| {
+            .for_each(|packet| {
                 if maybe_verify_and_resign_packet(
-                    &mut packet,
+                    packet,
                     &root_bank,
                     &working_bank,
                     cluster_info,
@@ -285,7 +287,7 @@ fn run_shred_sigverify<const K: usize>(
 /// Extracts shred bytes and, for repaired shreds, the location where the shred
 /// should be inserted into blockstore.
 fn extract_shred_and_location(
-    packet: PacketRef,
+    packet: &BytesPacket,
     repair_nonce_location_lookup: &RepairNonceLocationLookup,
     stats: &mut ShredSigVerifyStats,
 ) -> Option<(Vec<u8>, Option<BlockLocation>)> {
@@ -308,7 +310,7 @@ fn extract_shred_and_location(
 /// Checks whether the shred in the given `packet` is of resigned variant. If
 /// yes, it calls [`verify_and_resign_shred`].
 fn maybe_verify_and_resign_packet(
-    packet: &mut PacketRefMut,
+    packet: &mut BytesPacket,
     root_bank: &Bank,
     working_bank: &Bank,
     cluster_info: &ClusterInfo,
@@ -318,7 +320,7 @@ fn maybe_verify_and_resign_packet(
     keypair: &Keypair,
 ) -> Result<(), ResignError> {
     let repair = packet.meta().repair();
-    let shred = get_shred(packet.as_ref()).ok_or(shred::Error::InvalidPacketSize)?;
+    let shred = get_shred(packet).ok_or(shred::Error::InvalidPacketSize)?;
     let is_signed = is_retransmitter_signed_variant(shred)?;
     if is_signed {
         // Repair packets do not follow turbine tree and
@@ -445,8 +447,8 @@ fn get_slot_leaders<'a>(
         .iter_mut()
         .flat_map(|batch| batch.iter_mut())
         .filter(|packet| !packet.meta().discard())
-        .filter_map(move |mut packet| {
-            let shred = shred::layout::get_shred(packet.as_ref());
+        .filter_map(move |packet| {
+            let shred = shred::layout::get_shred(packet);
             let slot = shred.and_then(shred::layout::get_slot)?;
             let leader = leader_schedule_cache
                 .slot_leader_at(slot, Some(bank))
@@ -600,15 +602,45 @@ mod tests {
         solana_keypair::Keypair,
         solana_ledger::{
             genesis_utils::create_genesis_config_with_leader,
-            shred::{Nonce, ProcessShredsStats, ReedSolomonCache, Shredder},
+            shred::{Nonce, ProcessShredsStats, Shredder},
         },
         solana_net_utils::SocketAddrSpace,
-        solana_perf::packet::{Packet, PacketFlags, RecycledPacketBatch},
+        solana_perf::packet::{BytesPacketBatch, PacketFlags},
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_time_utils::timestamp,
         test_case::test_matrix,
     };
+
+    #[test]
+    fn test_dedup_ignores_retransmitter_signature() {
+        let mut rng = rand::rng();
+        let leader_keypair = Keypair::new();
+        let shredder = Shredder::new(1, 0, 1, 0).unwrap();
+        let entries = create_ticks(1, 1, Hash::new_unique());
+        let (shreds_data, _) = shredder.entries_to_resigned_merkle_shreds_for_tests(
+            &leader_keypair,
+            &entries,
+            true, // is_last_in_slot
+            Hash::new_unique(),
+            0,
+            0,
+        );
+        let mut shred_packet = shreds_data[0].payload().to_bytes_packet(None);
+        let mut other_packet = shreds_data[0].payload().to_bytes_packet(None);
+        shred::wire::resign_packet(&mut shred_packet, &Keypair::new()).unwrap();
+        shred::wire::resign_packet(&mut other_packet, &Keypair::new()).unwrap();
+        assert_ne!(shred_packet.data(..), other_packet.data(..));
+
+        let deduper = Deduper::<2, [u8]>::new(&mut rng, /*num_bits:*/ 1024);
+        let shred_bytes =
+            shred::wire::get_shred_without_retransmitter_signature(&shred_packet).unwrap();
+        let other_bytes =
+            shred::wire::get_shred_without_retransmitter_signature(&other_packet).unwrap();
+        assert_eq!(shred_bytes, other_bytes);
+        assert!(!deduper.dedup(shred_bytes));
+        assert!(deduper.dedup(other_bytes));
+    }
 
     #[test]
     fn test_sigverify_shreds_verify_batches() {
@@ -620,11 +652,6 @@ mod tests {
         );
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         let bank_forks = BankForks::new_rw_arc(bank);
-        let batch_size = 2;
-        let mut batch = RecycledPacketBatch::with_capacity(batch_size);
-        batch.resize(batch_size, Packet::default());
-        let mut batches = vec![batch];
-
         let entries = create_ticks(1, 1, Hash::new_unique());
         let shredder = Shredder::new(1, 0, 1, 0).unwrap();
         let (shreds_data, _shreds_code) = shredder.entries_to_merkle_shreds_for_tests(
@@ -634,7 +661,6 @@ mod tests {
             Hash::new_unique(),
             0,
             0,
-            &ReedSolomonCache::default(),
             &mut ProcessShredsStats::default(),
         );
         let (shreds_data_wrong, _shreds_code_wrong) = shredder.entries_to_merkle_shreds_for_tests(
@@ -644,17 +670,14 @@ mod tests {
             Hash::new_unique(),
             0,
             0,
-            &ReedSolomonCache::default(),
             &mut ProcessShredsStats::default(),
         );
 
-        let shred = shreds_data[0].clone();
-        batches[0][0].buffer_mut()[..shred.payload().len()].copy_from_slice(shred.payload());
-        batches[0][0].meta_mut().size = shred.payload().len();
-
-        let shred = shreds_data_wrong[0].clone();
-        batches[0][1].buffer_mut()[..shred.payload().len()].copy_from_slice(shred.payload());
-        batches[0][1].meta_mut().size = shred.payload().len();
+        let batch = BytesPacketBatch::from(vec![
+            shreds_data[0].payload().to_bytes_packet(None),
+            shreds_data_wrong[0].payload().to_bytes_packet(None),
+        ]);
+        let batches = vec![batch];
 
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
         let thread_pool = ThreadPoolBuilder::new().num_threads(3).build().unwrap();
@@ -672,7 +695,7 @@ mod tests {
                 &cache,
             )
         });
-        assert!(!batches[0].get(0).unwrap().meta().discard());
+        assert!(!batches[0].first().unwrap().meta().discard());
         assert!(batches[0].get(1).unwrap().meta().discard());
     }
 
@@ -698,16 +721,16 @@ mod tests {
 
         let shredder = Shredder::new(root_bank.slot(), root_bank.parent_slot(), 0, 0).unwrap();
         let entries = vec![Entry::new(&Hash::default(), 0, vec![])];
-        let mut shreds = shredder.make_merkle_shreds_from_entries(
+        // Only older leaders resign shreds.
+        let (data_shreds, coding_shreds) = shredder.entries_to_resigned_merkle_shreds_for_tests(
             &leader_keypair,
             &entries,
             is_last_in_slot,
             chained_merkle_root,
             0,
             0,
-            &ReedSolomonCache::default(),
-            &mut ProcessShredsStats::default(),
         );
+        let mut shreds: Vec<_> = data_shreds.into_iter().chain(coding_shreds).collect();
 
         let cluster_info = ClusterInfo::new(
             ContactInfo::new_localhost(&leader_pubkey, timestamp()),
@@ -725,34 +748,13 @@ mod tests {
             let keypair = Keypair::new();
             let nonce = repaired.then(|| rng.random::<Nonce>());
             if is_last_in_slot {
-                let packet = &mut shred.payload().to_packet(nonce);
-                let buf_before = packet.buffer_mut().to_vec();
-                if repaired {
-                    packet.meta_mut().flags |= PacketFlags::REPAIR;
-                }
-                maybe_verify_and_resign_packet(
-                    &mut packet.into(),
-                    &root_bank,
-                    &working_bank,
-                    &cluster_info,
-                    &leader_schedule_cache,
-                    &cluster_nodes_cache,
-                    &stats,
-                    &keypair,
-                )
-                .expect("packet should pass the verification");
-                assert!(!packet.meta().discard());
-
-                // Check whether the packet was modified.
-                assert_ne!(&buf_before, &packet.data(..).unwrap());
-
                 let mut bytes_packet = shred.payload().to_bytes_packet(nonce);
                 if repaired {
                     bytes_packet.meta_mut().flags |= PacketFlags::REPAIR;
                 }
                 let buf_addr = bytes_packet.buffer().as_ptr().addr();
                 maybe_verify_and_resign_packet(
-                    &mut bytes_packet.as_mut(),
+                    &mut bytes_packet,
                     &root_bank,
                     &working_bank,
                     &cluster_info,
@@ -768,30 +770,13 @@ mod tests {
                 let buf_addr_after = bytes_packet.buffer().as_ptr().addr();
                 assert_ne!(buf_addr, buf_addr_after);
             } else {
-                let packet = &mut shred.payload().to_packet(nonce);
-                if repaired {
-                    packet.meta_mut().flags |= PacketFlags::REPAIR;
-                }
-                maybe_verify_and_resign_packet(
-                    &mut packet.into(),
-                    &root_bank,
-                    &working_bank,
-                    &cluster_info,
-                    &leader_schedule_cache,
-                    &cluster_nodes_cache,
-                    &stats,
-                    &keypair,
-                )
-                .expect("packet should pass the verification");
-                assert!(!packet.meta().discard());
-
                 let mut bytes_packet = shred.payload().to_bytes_packet(nonce);
                 if repaired {
                     bytes_packet.meta_mut().flags |= PacketFlags::REPAIR;
                 }
                 let buf_addr = bytes_packet.buffer().as_ptr().addr();
                 maybe_verify_and_resign_packet(
-                    &mut bytes_packet.as_mut(),
+                    &mut bytes_packet,
                     &root_bank,
                     &working_bank,
                     &cluster_info,
@@ -801,7 +786,7 @@ mod tests {
                     &keypair,
                 )
                 .expect("packet should pass the verification");
-                assert!(!packet.meta().discard());
+                assert!(!bytes_packet.meta().discard());
 
                 // Packet should not be modified.
                 let buf_addr_after = bytes_packet.buffer().as_ptr().addr();

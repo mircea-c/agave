@@ -1,7 +1,9 @@
 //! Stakes serve as a cache of stake and vote accounts to derive
 //! node stakes
-#[cfg(feature = "frozen-abi")]
+#[cfg(feature = "stable-abi")]
 use solana_frozen_abi::stable_abi::{context::SequenceLenMax, sample_collection_sized};
+#[cfg(feature = "stable-abi")]
+use solana_frozen_abi_macro::{StableAbi, StableAbiSample};
 use {
     crate::{
         alpenglow_epoch_type::RewardEpochDelegatedStakes, stake_account,
@@ -88,6 +90,7 @@ impl StakesCache {
         Self(RwLock::new(stakes))
     }
 
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn stakes(&self) -> RwLockReadGuard<'_, Stakes<StakeAccount>> {
         self.0.read().unwrap()
     }
@@ -205,7 +208,7 @@ impl StakesCache {
 /// account and StakeStateV2 deserialized from the account. Doing so, will remove
 /// the need to load the stake account from accounts-db when working with
 /// stake-delegations.
-#[cfg_attr(feature = "frozen-abi", derive(StableAbi, StableAbiSample))]
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
 #[derive(Default, Clone, PartialEq, Debug, SchemaWrite)]
 #[cfg_attr(
     feature = "dev-context-only-utils",
@@ -224,14 +227,14 @@ pub struct Stakes<T: Clone> {
 
     /// stake_delegations
     #[cfg_attr(
-        feature = "frozen-abi",
+        feature = "stable-abi",
         stable_abi_sample(with = "sample_collection_sized(rng, SequenceLenMax(1))")
     )]
     #[wincode(with = "FromIntoIterator<ImblHashMap<Pubkey, T>, BincodeLen>")]
     stake_delegations: ImblHashMap<Pubkey, T>,
 
     /// current effective stake delegated to each vote account pubkey
-    #[cfg_attr(feature = "frozen-abi", stable_abi_sample(with = "Default::default()"))]
+    #[cfg_attr(feature = "stable-abi", stable_abi_sample(with = "Default::default()"))]
     #[wincode(skip)]
     delegated_stakes: DelegatedStakes,
 
@@ -261,10 +264,14 @@ impl<T: Clone> Stakes<T> {
         &self,
         max_vote_accounts: usize,
         minimum_vote_account_balance: u64,
+        block_revenue_sharing: bool,
     ) -> Stakes<T> {
         Self::new(
-            self.vote_accounts
-                .clone_and_filter_for_vat(max_vote_accounts, minimum_vote_account_balance),
+            self.vote_accounts.clone_and_filter_for_vat(
+                max_vote_accounts,
+                minimum_vote_account_balance,
+                block_revenue_sharing,
+            ),
             self.epoch,
         )
     }
@@ -764,6 +771,7 @@ impl Stakes<StakeAccount> {
     /// elements.
     ///
     /// [hamt]: https://en.wikipedia.org/wiki/Hash_array_mapped_trie
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn stake_delegations_vec(&self) -> Vec<(&Pubkey, &StakeAccount)> {
         self.stake_delegations.iter().collect()
     }
@@ -1541,5 +1549,54 @@ pub(crate) mod tests {
             !stakes.stake_delegations().contains_key(&stake_pubkey),
             case.is_droppable(in_epoch_rewards_period)
         );
+    }
+
+    #[test]
+    fn test_load_from_deserialized_delegations_ignores_reserved_bytes() {
+        let ((vote_pubkey, vote_account), (stake_pubkey, stake_account)) =
+            create_staked_node_accounts(10, &Rent::default());
+        let StakeStateV2::Stake(_, stake, _) = stake_account.state().unwrap() else {
+            unreachable!()
+        };
+        let get_account = |pubkey: &Pubkey| {
+            if *pubkey == vote_pubkey {
+                Some(vote_account.clone())
+            } else if *pubkey == stake_pubkey {
+                Some(stake_account.clone())
+            } else {
+                None
+            }
+        };
+        let deserialized = |delegation: Delegation| {
+            let mut vote_accounts = VoteAccounts::default();
+            vote_accounts.insert(
+                vote_pubkey,
+                VoteAccount::try_from(vote_account.clone()).unwrap(),
+                || 0,
+            );
+            DeserializableDelegationStakes {
+                vote_accounts,
+                stake_delegations: vec![(stake_pubkey, delegation)],
+                unused: 0,
+                epoch: 0,
+                stake_history: StakeHistory::default(),
+            }
+        };
+
+        // A snapshot written with the old `warmup_cooldown_rate` bytes loads.
+        let mut delegation = stake.delegation;
+        delegation._reserved = 0.25f64.to_le_bytes();
+        let stakes =
+            Stakes::load_from_deserialized_delegations(deserialized(delegation), get_account)
+                .unwrap();
+        assert!(stakes.stake_delegations().contains_key(&stake_pubkey));
+
+        // The other fields are still checked.
+        let mut delegation = stake.delegation;
+        delegation.stake += 1;
+        assert!(matches!(
+            Stakes::load_from_deserialized_delegations(deserialized(delegation), get_account),
+            Err(Error::InvalidDelegation(pubkey)) if pubkey == stake_pubkey
+        ));
     }
 }

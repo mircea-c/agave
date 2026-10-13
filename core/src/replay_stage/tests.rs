@@ -48,7 +48,7 @@ use {
         entry_notifier_service::EntryNotification,
         genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
         get_tmp_ledger_path, get_tmp_ledger_path_auto_delete,
-        shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
+        shred::{ProcessShredsStats, Shred, Shredder},
     },
     solana_net_utils::SocketAddrSpace,
     solana_poh::poh_recorder::create_test_recorder,
@@ -62,7 +62,10 @@ use {
         bank::BankTestConfig,
         block_component_processor::BlockComponentProcessorError,
         commitment::{BlockCommitment, VOTE_THRESHOLD_SIZE},
-        genesis_utils::{GenesisConfigInfo, ValidatorVoteKeypairs},
+        genesis_utils::{
+            GenesisConfigInfo, ValidatorVoteKeypairs, bootstrap_validator_stake_lamports,
+            create_genesis_config_with_tower_leader,
+        },
     },
     solana_sha256_hasher::hash,
     solana_shred_version::compute_shred_version,
@@ -109,7 +112,7 @@ fn test_far_future_optimistic_parent_requires_parent_window_ready() {
         .unwrap();
     let parent_bank =
         Bank::new_from_parent_with_bank_forks(&bank_forks, root_bank, parent_leader, parent_slot);
-    let parent_block_id = Hash::new_unique();
+    let parent_block_id = BlockId::new_unique();
     parent_bank.set_block_id(Some(parent_block_id));
     parent_bank.freeze();
 
@@ -232,7 +235,6 @@ fn block_marker_shreds_with_last(
             Hash::new_unique(),
             shred_index,
             shred_index,
-            &ReedSolomonCache::default(),
             &mut ProcessShredsStats::default(),
         )
 }
@@ -242,7 +244,7 @@ fn insert_update_parent_slot(
     slot: Slot,
     block_header_parent_slot: Slot,
     update_parent_slot: Slot,
-    update_parent_block_id: Hash,
+    update_parent_block_id: BlockId,
     replay_fec_set_index: u32,
 ) {
     let header = VersionedBlockMarker::from_block_header(BlockHeaderV1 {
@@ -654,6 +656,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
     let root_bank = bank_forks.read().unwrap().root_bank();
     let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
     let (drop_bank_sender, _drop_bank_receiver) = bounded(1024);
+    let (votor_commitment_sender, votor_commitment_receiver) = bounded(1024);
     let context = ProcessBankForksContext {
         bank_forks: bank_forks.clone(),
         blockstore: blockstore.clone(),
@@ -662,6 +665,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         rpc_subscriptions: None,
         drop_bank_sender,
         leader_schedule_cache,
+        votor_commitment_sender,
     };
     let my_pubkey = Pubkey::new_unique();
 
@@ -689,7 +693,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
     assert_eq!(bank_forks.read().unwrap().root(), 0);
     assert!(!blockstore.is_root(1));
 
-    let unfrozen_block_id = Hash::new_unique();
+    let unfrozen_block_id = BlockId::new_unique();
     let unfrozen_bank = Bank::new_from_parent(root_bank, SlotLeader::default(), 2);
     unfrozen_bank.set_block_id(Some(unfrozen_block_id));
     bank_forks.write().unwrap().insert(unfrozen_bank);
@@ -707,6 +711,8 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
     );
     assert_eq!(bank_forks.read().unwrap().root(), 0);
     assert!(!blockstore.is_root(2));
+    // A root replay didn't apply is never published to the commitment cache.
+    assert!(votor_commitment_receiver.is_empty());
 
     let block_id = bank_forks.read().unwrap().block_id(1).unwrap();
     let matching_command = SetRootCommand {
@@ -720,6 +726,14 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
     );
     assert_eq!(bank_forks.read().unwrap().root(), 1);
     assert!(blockstore.is_root(1));
+    assert_eq!(
+        votor_commitment_receiver.try_recv().unwrap(),
+        CommitmentAggregationData {
+            commitment_type: CommitmentType::Rooted,
+            slot: 1,
+        }
+    );
+    assert!(votor_commitment_receiver.is_empty());
 }
 
 #[test]
@@ -993,7 +1007,6 @@ fn test_dead_fork_entry_deserialize_failure() {
 
         let shredder = Shredder::new(bank.slot(), bank.parent_slot(), 0, 0).unwrap();
         let keypair = Keypair::new();
-        let reed_solomon_cache = ReedSolomonCache::default();
 
         shredder
             .make_shreds_from_data_slice(
@@ -1003,7 +1016,6 @@ fn test_dead_fork_entry_deserialize_failure() {
                 Hash::default(),
                 0,
                 0,
-                &reed_solomon_cache,
                 &mut ProcessShredsStats::default(),
             )
             .unwrap()
@@ -1444,7 +1456,7 @@ fn test_abandon_invalidates() {
     } = vote_simulator;
 
     let slot = 4;
-    let parent_block_id = Hash::new_unique();
+    let parent_block_id = BlockId::new_unique();
     insert_update_parent_slot(&blockstore, slot, 3, 0, parent_block_id, 32);
     let bank0 = bank_forks.read().unwrap().get(0).unwrap();
     let bank = Bank::new_from_parent(bank0, SlotLeader::default(), slot);
@@ -1504,7 +1516,7 @@ fn test_abandon_invalidates() {
     assert_eq!(update_parent.slot, slot);
     assert_eq!(update_parent.cleared_bank_id, bank.bank_id());
     assert_eq!(update_parent.parent_slot, 0);
-    assert_eq!(update_parent.parent_block_id, parent_block_id);
+    assert_eq!(update_parent.parent_block_id, parent_block_id.to_hash());
 }
 
 // Given a shred and a fatal expected error, check that replaying that shred causes causes the fork to be
@@ -3215,7 +3227,7 @@ fn test_update_parent_restart() {
 
     let (tx, rx) = bounded(1024);
     for slot in [4, 8, 12, 16] {
-        let parent_block_id = Hash::new_unique();
+        let parent_block_id = BlockId::new_unique();
         insert_update_parent_slot(
             &blockstore,
             slot,
@@ -3296,7 +3308,7 @@ fn test_headerless_update_parent() {
     };
     let update_parent = VersionedBlockMarker::from_update_parent(UpdateParentV1 {
         new_parent_slot: 0,
-        new_parent_block_id: Hash::default(),
+        new_parent_block_id: BlockId::default(),
     });
 
     let mut shreds = block_marker_shreds(slot, 0, footer_marker(), 0);
@@ -3614,7 +3626,7 @@ fn test_spurious_update_parent_boundary(replayed_shreds: u64, should_be_hard: bo
     });
     let update_parent = VersionedBlockMarker::from_update_parent(UpdateParentV1 {
         new_parent_slot: 0,
-        new_parent_block_id: Hash::default(),
+        new_parent_block_id: BlockId::default(),
     });
     let mut shreds = block_marker_shreds(slot, 0, header, 0);
     shreds.retain(|shred| !shred.is_data() || shred.index() != 0);
@@ -3715,7 +3727,7 @@ fn test_before_update_soft_dead() {
     });
     let update_parent = VersionedBlockMarker::from_update_parent(UpdateParentV1 {
         new_parent_slot: 0,
-        new_parent_block_id: Hash::default(),
+        new_parent_block_id: BlockId::default(),
     });
     let mut shreds = block_marker_shreds(slot, 0, header, 0);
     shreds.retain(|shred| !shred.is_data() || shred.index() != 0);
@@ -3771,7 +3783,7 @@ fn test_soft_dead_restarts() {
     } = vote_simulator;
 
     let slot = 4;
-    let parent_block_id = Hash::new_unique();
+    let parent_block_id = BlockId::new_unique();
     insert_update_parent_slot(&blockstore, slot, 3, 0, parent_block_id, 32);
     let bank0 = bank_forks.read().unwrap().get(0).unwrap();
     let bank = Bank::new_from_parent(bank0, SlotLeader::default(), slot);
@@ -3946,7 +3958,7 @@ fn test_replay_own_update_full() {
         slot,
         1,
         0,
-        Hash::new_unique(),
+        BlockId::new_unique(),
         replay_fec_set_index,
     );
     let mut meta = blockstore.meta(slot).unwrap().unwrap();
@@ -6586,7 +6598,11 @@ fn test_initialize_progress_and_fork_choice_with_duplicates() {
     agave_logger::setup();
     let GenesisConfigInfo {
         mut genesis_config, ..
-    } = create_genesis_config(123);
+    } = create_genesis_config_with_tower_leader(
+        123,
+        &Pubkey::new_unique(),
+        bootstrap_validator_stake_lamports(),
+    );
 
     let ticks_per_slot = 1;
     genesis_config.ticks_per_slot = ticks_per_slot;

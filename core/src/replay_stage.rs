@@ -32,7 +32,9 @@ use {
         voting_service::VoteOp,
         window_service::DuplicateSlotReceiver,
     },
+    agave_jemalloc::jemalloc::Arena,
     agave_votor::{
+        commitment::{self, CommitmentAggregationData, CommitmentType},
         event::{
             CompletedBlock, LatestSwitchRequest, LeaderWindowInfo, SwitchBankEvent, VotorEvent,
             VotorEventSender,
@@ -43,7 +45,7 @@ use {
     },
     agave_votor_messages::{
         certificate::Certificate,
-        consensus_message::{Block, VoteMessage},
+        consensus_message::{Block, BlockId, VoteMessage},
         migration::{GENESIS_VOTE_REFRESH, MigrationStatus},
         vote::Vote,
     },
@@ -52,7 +54,7 @@ use {
     rayon::{ThreadPool, prelude::*},
     smallvec::SmallVec,
     solana_accounts_db::contains::Contains,
-    solana_clock::{BankId, Slot},
+    solana_clock::Slot,
     solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifierArc,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
@@ -83,7 +85,7 @@ use {
         slot_status_notifier::SlotStatusNotifier,
     },
     solana_runtime::{
-        bank::{Bank, MAX_ALPENGLOW_VOTE_ACCOUNTS, NewBankOptions, bank_hash_details},
+        bank::{Bank, BankId, MAX_ALPENGLOW_VOTE_ACCOUNTS, NewBankOptions, bank_hash_details},
         bank_forks::BankForks,
         bank_forks_controller::{BankForksCommand, BankForksCommandReceiver, SetRootCommand},
         block_component_processor::BlockComponentProcessorError,
@@ -275,6 +277,7 @@ struct ProcessBankForksContext {
     rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
     drop_bank_sender: Sender<Vec<BankWithScheduler>>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
+    votor_commitment_sender: Sender<CommitmentAggregationData>,
 }
 
 impl ProcessActiveBanksContext {
@@ -442,6 +445,7 @@ pub struct ReplayStageConfig {
     pub snapshot_controller: Option<Arc<SnapshotController>>,
     pub replay_highest_frozen: Arc<ReplayHighestFrozen>,
     pub highest_parent_ready: Arc<RwLock<(Slot, Block)>>,
+    pub(crate) replay_arena: Option<Arena>,
 }
 
 pub struct ReplaySenders {
@@ -465,6 +469,7 @@ pub struct ReplaySenders {
     pub footer_certs_sender: Sender<SmallVec<[Certificate; 2]>>,
     pub optimistic_parent_sender: Sender<LeaderWindowInfo>,
     pub lockouts_sender: Sender<TowerCommitmentAggregationData>,
+    pub votor_commitment_sender: Sender<CommitmentAggregationData>,
 }
 
 pub struct ReplayReceivers {
@@ -763,6 +768,7 @@ impl ReplayStage {
             snapshot_controller,
             replay_highest_frozen,
             highest_parent_ready,
+            replay_arena,
         } = config;
 
         let ReplaySenders {
@@ -786,6 +792,7 @@ impl ReplayStage {
             lockouts_sender,
             own_votes_sender,
             footer_certs_sender,
+            votor_commitment_sender,
         } = senders;
 
         let ReplayReceivers {
@@ -816,6 +823,11 @@ impl ReplayStage {
         *replay_highest_frozen.highest_frozen_slot.lock().unwrap() = highest_frozen_slot;
 
         let run_replay = move || {
+            if let Some(arena) = replay_arena {
+                arena
+                    .bind_current_thread_permanently()
+                    .expect("failed to bind replay thread to jemalloc arena");
+            }
             let _exit = Finalizer::new(exit.clone());
 
             if my_pubkey != tower.node_pubkey {
@@ -930,6 +942,7 @@ impl ReplayStage {
                 rpc_subscriptions: rpc_subscriptions.clone(),
                 drop_bank_sender: drop_bank_sender.clone(),
                 leader_schedule_cache: leader_schedule_cache.clone(),
+                votor_commitment_sender,
             };
 
             let poh_shared_leader_state = poh_recorder.read().unwrap().shared_leader_state();
@@ -2326,7 +2339,7 @@ impl ReplayStage {
         // `remove_unrooted_slots()` call.
         drop(removed_banks);
 
-        for (slot, slot_id) in slots_to_purge {
+        for (slot, bank_id) in slots_to_purge {
             // Clear the slot signatures from status cache for this slot.
             // TODO: What about RPC queries that had already cloned the Bank for this slot
             // and are looking up the signature for this slot?
@@ -2340,7 +2353,7 @@ impl ReplayStage {
                 // also be a duplicate. In this case we *need* to repair it, so we clear from
                 // blockstore.
                 warn!(
-                    "purging duplicate descendant: {slot} with slot_id {slot_id} and bank hash \
+                    "purging duplicate descendant: {slot} with bank_id {bank_id:?} and bank hash \
                      {bank_hash}, of slot {slot_to_purge}"
                 );
                 // Clear the slot-related data in blockstore. This will:
@@ -2349,7 +2362,7 @@ impl ReplayStage {
                 // this slot
                 blockstore.clear_unconfirmed_slot(slot);
             } else if slot == slot_to_purge {
-                warn!("purging duplicate slot: {slot} with slot_id {slot_id}");
+                warn!("purging duplicate slot: {slot} with bank_id {bank_id:?}");
                 blockstore.clear_unconfirmed_slot(slot);
             } else {
                 // If a descendant was unable to replay and chained from a duplicate, it is not
@@ -2477,7 +2490,7 @@ impl ReplayStage {
         // Check if we have received the block and all of its ancestors and collect the ones we
         // need to switch out
         let mut ancestor_slot = block.slot;
-        let mut ancestor_block_id = block.block_id;
+        let mut ancestor_block_id = block.block_id.to_hash();
         let mut blocks_to_switch = vec![];
         let mut original_dead_slots_to_clear = BTreeSet::new();
         loop {
@@ -2511,7 +2524,7 @@ impl ReplayStage {
             let parent_slot = slot_meta
                 .parent_slot
                 .expect("Full slots must have a parent");
-            let parent_block_id = slot_meta.parent_block_id;
+            let parent_block_id = BlockId::from(slot_meta.parent_block_id);
 
             if bank_forks.read().unwrap().block_id(parent_slot) == Some(parent_block_id)
                 // Genesis cannot be duplicate
@@ -2526,7 +2539,7 @@ impl ReplayStage {
             }
 
             // Check the next ancestor
-            ancestor_block_id = parent_block_id;
+            ancestor_block_id = parent_block_id.to_hash();
             ancestor_slot = parent_slot;
         }
 
@@ -3163,6 +3176,9 @@ impl ReplayStage {
         // `finalized` confirmation if a node is materially staked and servicing RPC requests at
         // the same time for development purposes.
         let node_vote_state = (*vote_account_pubkey, tower.vote_state.clone());
+        // Runs after `check_and_handle_new_root` above, so the published root
+        // is already in the blockstore. Alpenglow keeps the same order in
+        // `process_set_root_command`.
         Self::update_commitment_cache(
             bank.clone(),
             bank_forks.read().unwrap().root(),
@@ -4047,7 +4063,8 @@ impl ReplayStage {
                 let block_id = process_active_banks_context
                     .blockstore
                     .get_block_id(bank.slot(), &process_active_banks_context.migration_status)
-                    .expect("Blockstore operations must succeed");
+                    .expect("Blockstore operations must succeed")
+                    .map(BlockId::from);
                 debug_assert!(block_id.is_some() || !bank.should_replay_from_blockstore());
                 if block_id.is_some() {
                     bank.set_block_id(block_id);
@@ -4747,7 +4764,7 @@ impl ReplayStage {
             progress
                 .get_hash(last_voted_slot)
                 .expect("Must exist for us to have frozen descendant"),
-            block_id,
+            block_id.to_hash(),
         );
         // Since we are updating our tower we need to update associated caches for previously computed
         // slots as well.
@@ -5248,6 +5265,17 @@ impl ReplayStage {
             my_pubkey,
             |bank_forks| progress.handle_new_root(bank_forks),
         );
+
+        // Publish the root only after its root markers are written and bank
+        // forks is rooted, so commitment cache readers never see a root the
+        // blockstore doesn't have yet. TowerBFT keeps the same order in
+        // `handle_votable_bank`.
+        commitment::update_commitment_cache(
+            my_pubkey,
+            CommitmentType::Rooted,
+            new_root,
+            &context.votor_commitment_sender,
+        );
     }
 
     /// Process a bank forks command
@@ -5273,11 +5301,27 @@ impl ReplayStage {
                 // Check that the bank is still valid to be inserted
                 let bank = {
                     let mut bank_forks = context.bank_forks.write().unwrap();
-                    if bank_forks.get(bank.slot()).is_none()
-                        && bank_forks.get(bank.parent_slot()).is_some()
-                    {
+                    if bank_forks.get(bank.slot()).is_some() {
+                        // Bank already exists in the bank forks.
+                        None
+                    } else if bank.parent().is_some_and(|expected_parent| {
+                        bank_forks
+                            .get(bank.parent_slot())
+                            .is_some_and(|current_parent| {
+                                current_parent.bank_id() == expected_parent.bank_id()
+                            })
+                    }) {
+                        // The normal case where bank parent meta matches what's in bank forks.
                         Some(bank_forks.insert(*bank))
                     } else {
+                        // Purge these banks inline so we are not waiting on the lazy Accounts
+                        // Background Service for cleanup.
+                        drop(bank_forks);
+                        let slot = bank.slot();
+                        bank.remove_unrooted_slots(&[(slot, bank.bank_id())]);
+                        bank.clear_slot_signatures(slot);
+                        bank.prune_program_cache_by_deployment_slot(slot);
+                        drop(bank);
                         None
                     }
                 };

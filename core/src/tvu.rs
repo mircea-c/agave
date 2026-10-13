@@ -29,8 +29,11 @@ use {
     agave_bls_sigverify::{
         bls_sigverifier::{self, SigVerifierChannels, SigVerifierContext},
         generated_cert_types::GeneratedCertTypes,
+        metric_types::MAX_IN_FLIGHT_CONSENSUS_EVENTS,
+        pubkeys::VerifiedVotorSlotsMessage,
         rewards::RewardInput,
     },
+    agave_jemalloc::jemalloc::Arena,
     agave_votor::{
         event::{LatestSwitchRequest, LeaderWindowInfo, VotorEventReceiver, VotorEventSender},
         peer_list_updater::PeerListService,
@@ -40,10 +43,7 @@ use {
         voting_service::{VotingService as BLSVotingService, votor_rate_limit_pps},
         votor::{Votor, VotorConfig},
     },
-    agave_votor_messages::{
-        VerifiedVotorSlotsMessage, consensus_message::Block,
-        metric_types::MAX_IN_FLIGHT_CONSENSUS_EVENTS,
-    },
+    agave_votor_messages::consensus_message::Block,
     agave_votor_transport::{PeerList, endpoint::QuicDatagramEndpoint},
     arc_swap::ArcSwap,
     crossbeam_channel::{Receiver, Sender, bounded, unbounded},
@@ -161,6 +161,7 @@ pub struct TvuConfig {
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<TurbineXdpSender>,
     pub repair_xdp_sender: Option<PinnedXdpSender>,
+    pub(crate) replay_arena: Option<Arena>,
 }
 
 impl Default for TvuConfig {
@@ -177,6 +178,7 @@ impl Default for TvuConfig {
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             turbine_xdp_sender: None,
             repair_xdp_sender: None,
+            replay_arena: None,
         }
     }
 }
@@ -544,7 +546,7 @@ impl Tvu {
             highest_finalized: highest_finalized.clone(),
             bank_forks_controller,
             bls_sender: bls_sender.clone(),
-            commitment_sender: votor_commitment_sender,
+            commitment_sender: votor_commitment_sender.clone(),
             bank_notification_sender: bank_notification_sender.clone(),
             leader_window_info_sender,
             highest_parent_ready: highest_parent_ready.clone(),
@@ -582,6 +584,7 @@ impl Tvu {
             footer_certs_sender,
             optimistic_parent_sender,
             lockouts_sender,
+            votor_commitment_sender,
         };
 
         let replay_receivers = ReplayReceivers {
@@ -620,6 +623,7 @@ impl Tvu {
             snapshot_controller,
             replay_highest_frozen,
             highest_parent_ready,
+            replay_arena: tvu_config.replay_arena,
         };
 
         let voting_service = VotingService::new(

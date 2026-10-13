@@ -13,7 +13,7 @@ use {
     solana_account::{
         Account, AccountSharedData, ReadableAccount, state_traits::StateMutWincode as _,
     },
-    solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs,
+    solana_accounts_db::utils::create_accounts_run_dir,
     solana_clock::{DEFAULT_DEV_SLOTS_PER_EPOCH, DEFAULT_TICKS_PER_SLOT, Slot},
     solana_cluster_type::ClusterType,
     solana_commitment_config::CommitmentConfig,
@@ -182,11 +182,7 @@ impl LocalCluster {
         config: &mut ValidatorConfig,
         ledger_path: &Path,
     ) {
-        config.account_paths = vec![
-            create_accounts_run_and_snapshot_dirs(ledger_path.join("accounts"))
-                .unwrap()
-                .0,
-        ];
+        config.account_paths = vec![create_accounts_run_dir(ledger_path.join("accounts")).unwrap()];
         config.tower_storage = Arc::new(FileTowerStorage::new(ledger_path.to_path_buf()));
         config.accounts_db_config.bank_hash_details_dir = ledger_path.to_path_buf();
         config.vote_history_storage =
@@ -203,12 +199,12 @@ impl LocalCluster {
     }
 
     pub fn new(config: &mut ClusterConfig, socket_addr_space: SocketAddrSpace) -> Self {
-        Self::init(config, socket_addr_space, AlpenglowMode::Disabled)
-    }
-
-    pub fn new_alpenglow(config: &mut ClusterConfig, socket_addr_space: SocketAddrSpace) -> Self {
         config.poh_config.hashes_per_tick = None;
         Self::init(config, socket_addr_space, AlpenglowMode::Enabled)
+    }
+
+    pub fn new_tower(config: &mut ClusterConfig, socket_addr_space: SocketAddrSpace) -> Self {
+        Self::init(config, socket_addr_space, AlpenglowMode::Disabled)
     }
 
     pub fn init(
@@ -282,7 +278,10 @@ impl LocalCluster {
         let leader_pubkey = leader_keypair.pubkey();
         let leader_node = Node::new_localhost_with_pubkey(&leader_pubkey);
 
-        let feature_set = FeatureSet::all_enabled();
+        let mut feature_set = FeatureSet::all_enabled();
+        if alpenglow_mode != AlpenglowMode::Enabled {
+            feature_set.deactivate(&agave_feature_set::alpenglow::id());
+        }
 
         let stakes_in_genesis_for_funding = stakes_in_genesis.clone();
         let GenesisConfigInfo {
@@ -294,8 +293,7 @@ impl LocalCluster {
             &keys_in_genesis,
             stakes_in_genesis,
             config.cluster_type,
-            &feature_set,
-            matches!(alpenglow_mode, AlpenglowMode::Enabled), /* is_alpenglow */
+            feature_set,
         );
 
         // In-genesis validators only receive the generic validator account funding from the

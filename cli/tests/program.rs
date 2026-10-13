@@ -7,7 +7,7 @@ use {
     },
     assert_matches::assert_matches,
     serde_json::Value,
-    solana_account::ReadableAccount,
+    solana_account::{ReadableAccount, state_traits::StateMutWincode as _},
     solana_borsh::v1::try_from_slice_unchecked,
     solana_cli::{
         cli::{CliCommand, CliConfig, process_command},
@@ -22,10 +22,14 @@ use {
     solana_fee_calculator::FeeRateGovernor,
     solana_keypair::Keypair,
     solana_loader_v3_interface::{
-        instruction::{self as loader_v3_instruction, MINIMUM_EXTEND_PROGRAM_BYTES},
+        get_program_data_address,
+        instruction::{
+            self as loader_v3_instruction, MINIMUM_EXTEND_PROGRAM_BYTES,
+            UpgradeableLoaderInstruction,
+        },
         state::UpgradeableLoaderState,
     },
-    solana_message::Message,
+    solana_message::{Message, VersionedMessage},
     solana_native_token::LAMPORTS_PER_SOL,
     solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
@@ -70,9 +74,13 @@ fn test_validator_genesis(
             lamports_per_byte: 1,
             ..Rent::default()
         })
-        .faucet_addr(Some(run_local_faucet_with_unique_port_for_tests(
-            mint_keypair.insecure_clone(),
-        )));
+        .rpc_config(JsonRpcConfig {
+            enable_rpc_transaction_history: true,
+            faucet_addr: Some(run_local_faucet_with_unique_port_for_tests(
+                mint_keypair.insecure_clone(),
+            )),
+            ..JsonRpcConfig::default_for_test()
+        });
 
     let LoaderV3Features {
         minimum_extend_program_size,
@@ -126,6 +134,29 @@ async fn expect_account_absent(rpc_client: &RpcClient, pubkey: Pubkey, absent_be
         "Failed to retrieve an account details. Expected account to be absent, but got a \
          different error: {error_actual}",
     );
+}
+
+async fn fetch_and_decode_transaction(
+    rpc_client: &RpcClient,
+    signature: &Signature,
+) -> Transaction {
+    rpc_client
+        .get_transaction_with_config(
+            signature,
+            RpcTransactionConfig {
+                encoding: Some(UiTransactionEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                ..RpcTransactionConfig::default()
+            },
+        )
+        .await
+        .unwrap()
+        .transaction
+        .transaction
+        .decode()
+        .unwrap()
+        .into_legacy_transaction()
+        .unwrap()
 }
 
 struct ExtendProgramTestSetup<'a> {
@@ -1357,7 +1388,7 @@ async fn test_cli_program_deploy_with_authority() {
     if let UpgradeableLoaderState::ProgramData {
         slot: _,
         upgrade_authority_address,
-    } = bincode::deserialize(&programdata_account.data).unwrap()
+    } = programdata_account.state().unwrap()
     {
         assert_eq!(upgrade_authority_address, None);
     } else {
@@ -1386,10 +1417,15 @@ async fn test_cli_program_deploy_with_authority() {
     assert_eq!("none", authority_pubkey_str);
 }
 
-#[test_case(true; "Skip preflight")]
-#[test_case(false; "Dont skip preflight")]
+#[test_case(true, false; "Skip preflight")]
+#[test_case(false, false; "Dont skip preflight")]
+#[test_case(true, true; "Skip preflight with SIMD-0433")]
+#[test_case(false, true; "Dont skip preflight with SIMD-0433")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
+async fn test_cli_program_upgrade_auto_extend(
+    skip_preflight: bool,
+    set_programdata_to_elf_length: bool,
+) {
     agave_logger::setup();
 
     let mut noop_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1409,7 +1445,7 @@ async fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
         &mint_keypair,
         LoaderV3Features {
             minimum_extend_program_size: false,
-            set_programdata_to_elf_length: false,
+            set_programdata_to_elf_length,
         },
     )
     .start_async_with_mint_address(&mint_keypair, SocketAddrSpace::Unspecified)
@@ -1476,6 +1512,7 @@ async fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
     config.output_format = OutputFormat::JsonCompact;
     config.send_transaction_config.skip_preflight = skip_preflight;
     process_command(&config).await.unwrap();
+    let programdata_pubkey = get_program_data_address(&program_keypair.pubkey());
 
     // Attempt to upgrade the program with a larger program, but with the
     // --no-auto-extend flag.
@@ -1488,7 +1525,7 @@ async fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
         buffer_signer_index: None,
         buffer_pubkey: None,
         upgrade_authority_signer_index: 1,
-        is_final: true,
+        is_final: false,
         max_len: None,
         skip_fee_check: false,
         compute_unit_price: None,
@@ -1497,7 +1534,45 @@ async fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
         use_rpc: false,
         skip_feature_verification: true,
     });
-    if skip_preflight {
+    if set_programdata_to_elf_length {
+        // SIMD-0433: The upgrade grows the program data account by itself.
+        process_command(&config).await.unwrap();
+        let programdata_account = rpc_client.get_account(&programdata_pubkey).await.unwrap();
+        assert_eq!(
+            programdata_account.data.len(),
+            UpgradeableLoaderState::size_of_programdata(program_data_large.len()),
+        );
+
+        // Wait one slot to avoid "Program was deployed in this block already" error
+        wait_n_slots(&rpc_client, 1).await;
+
+        // Shrink it back down, so the auto-extend upgrade below has to grow it.
+        config.command = CliCommand::Program(ProgramCliCommand::Deploy {
+            program_location: Some(noop_path.to_str().unwrap().to_string()),
+            fee_payer_signer_index: 0,
+            program_signer_index: None,
+            program_pubkey: Some(program_keypair.pubkey()),
+            buffer_signer_index: None,
+            buffer_pubkey: None,
+            upgrade_authority_signer_index: 1,
+            is_final: false,
+            max_len: None,
+            skip_fee_check: false,
+            compute_unit_price: None,
+            max_sign_attempts: 5,
+            auto_extend: false, // --no-auto-extend flag is present
+            use_rpc: false,
+            skip_feature_verification: true,
+        });
+        process_command(&config).await.unwrap();
+        let programdata_account = rpc_client.get_account(&programdata_pubkey).await.unwrap();
+        assert_eq!(
+            programdata_account.data.len(),
+            UpgradeableLoaderState::size_of_programdata(program_data.len()),
+        );
+
+        wait_n_slots(&rpc_client, 1).await;
+    } else if skip_preflight {
         expect_command_failure(
             &config,
             "Cannot upgrade a program when ELF does not fit into the allocated data account",
@@ -1547,21 +1622,18 @@ async fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
     });
     let response = process_command(&config).await;
     let json: Value = serde_json::from_str(&response.unwrap()).unwrap();
-    let program_pubkey_str = json
+    let final_signature = json
         .as_object()
         .unwrap()
-        .get("programId")
-        .unwrap()
-        .as_str()
+        .get("signature")
+        .and_then(|s| s.as_str())
+        .map(|s| Signature::from_str(s).unwrap())
         .unwrap();
-    let program_pubkey = Pubkey::from_str(program_pubkey_str).unwrap();
-    let (programdata_pubkey, _) =
-        Pubkey::find_program_address(&[program_pubkey.as_ref()], &bpf_loader_upgradeable::id());
     let programdata_account = rpc_client.get_account(&programdata_pubkey).await.unwrap();
     if let UpgradeableLoaderState::ProgramData {
         slot: _,
         upgrade_authority_address,
-    } = bincode::deserialize(&programdata_account.data).unwrap()
+    } = programdata_account.state().unwrap()
     {
         assert_eq!(upgrade_authority_address, None);
     } else {
@@ -1571,6 +1643,42 @@ async fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
         programdata_account.data().len(),
         UpgradeableLoaderState::size_of_programdata(program_data_large.len()),
     );
+
+    // Only the pre-SIMD-0433 auto-extend upgrade sends an extend.
+    let signatures = loop {
+        let signatures: Vec<_> = rpc_client
+            .get_signatures_for_address_with_config(
+                &programdata_pubkey,
+                GetConfirmedSignaturesForAddress2Config {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..GetConfirmedSignaturesForAddress2Config::default()
+                },
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|status| Signature::from_str(&status.signature).unwrap())
+            .collect();
+        if signatures.contains(&final_signature) {
+            break signatures;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    let mut extends = 0;
+    for signature in &signatures {
+        let tx = fetch_and_decode_transaction(&rpc_client, signature).await;
+        for instruction in &tx.message.instructions {
+            if instruction.program_id(&tx.message.account_keys) == &bpf_loader_upgradeable::id()
+                && matches!(
+                    wincode::deserialize(&instruction.data),
+                    Ok(UpgradeableLoaderInstruction::ExtendProgram { .. })
+                )
+            {
+                extends += 1;
+            }
+        }
+    }
+    assert_eq!(extends, if set_programdata_to_elf_length { 0 } else { 1 });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -2077,9 +2185,7 @@ async fn test_cli_program_write_buffer() {
     let buffer_account = rpc_client.get_account(&new_buffer_pubkey).await.unwrap();
     assert_eq!(buffer_account.lamports, minimum_balance_for_buffer_default);
     assert_eq!(buffer_account.owner, bpf_loader_upgradeable::id());
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(keypair.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -2124,9 +2230,7 @@ async fn test_cli_program_write_buffer() {
         .unwrap();
     assert_eq!(buffer_account.lamports, minimum_balance_for_buffer);
     assert_eq!(buffer_account.owner, bpf_loader_upgradeable::id());
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(keypair.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -2196,9 +2300,7 @@ async fn test_cli_program_write_buffer() {
         .unwrap();
     assert_eq!(buffer_account.lamports, minimum_balance_for_buffer_default);
     assert_eq!(buffer_account.owner, bpf_loader_upgradeable::id());
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(authority_keypair.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -2238,9 +2340,7 @@ async fn test_cli_program_write_buffer() {
     let buffer_account = rpc_client.get_account(&buffer_pubkey).await.unwrap();
     assert_eq!(buffer_account.lamports, minimum_balance_for_buffer_default);
     assert_eq!(buffer_account.owner, bpf_loader_upgradeable::id());
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(authority_keypair.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -2340,7 +2440,7 @@ async fn test_cli_program_write_buffer() {
     );
     close_message.recent_blockhash = rpc_client.get_latest_blockhash().await.unwrap();
     let close_fee = rpc_client
-        .get_fee_for_message(&close_message)
+        .get_fee_for_versioned_message(&VersionedMessage::Legacy(close_message))
         .await
         .unwrap();
     config.signers = vec![&keypair];
@@ -2588,9 +2688,7 @@ async fn test_cli_program_set_buffer_authority() {
         .get_account(&buffer_keypair.pubkey())
         .await
         .unwrap();
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(keypair.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -2622,9 +2720,7 @@ async fn test_cli_program_set_buffer_authority() {
         .get_account(&buffer_keypair.pubkey())
         .await
         .unwrap();
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(new_buffer_authority.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -2685,9 +2781,7 @@ async fn test_cli_program_set_buffer_authority() {
         .get_account(&buffer_keypair.pubkey())
         .await
         .unwrap();
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(buffer_keypair.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -2783,9 +2877,7 @@ async fn test_cli_program_mismatch_buffer_authority() {
         .get_account(&buffer_keypair.pubkey())
         .await
         .unwrap();
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(buffer_authority.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -3165,6 +3257,36 @@ async fn test_cli_program_show() {
         .unwrap();
     assert_eq!(max_len, data_len as usize);
 
+    // Verify show --buffers
+    config.command = CliCommand::Program(ProgramCliCommand::Show {
+        account_pubkey: None,
+        authority_pubkey: authority_keypair.pubkey(),
+        get_programs: false,
+        get_buffers: true,
+        all: false,
+        use_lamports_unit: false,
+    });
+    let response = process_command(&config).await.unwrap();
+    let json: Value = serde_json::from_str(&response).unwrap();
+    let buffers = json
+        .as_object()
+        .unwrap()
+        .get("buffers")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let buffer_address = buffer_keypair.pubkey().to_string();
+    let buffer = buffers
+        .iter()
+        .find(|buffer| {
+            buffer.get("address").and_then(Value::as_str) == Some(buffer_address.as_str())
+        })
+        .unwrap();
+    assert_eq!(
+        buffer.get("dataLen").unwrap().as_u64().unwrap(),
+        max_len as u64
+    );
+
     // Deploy
     let program_keypair = Keypair::new();
     config.signers = vec![&keypair, &authority_keypair, &program_keypair];
@@ -3256,6 +3378,36 @@ async fn test_cli_program_show() {
         .as_u64()
         .unwrap();
     assert_eq!(max_len, data_len as usize);
+
+    // Verify show --programs
+    config.command = CliCommand::Program(ProgramCliCommand::Show {
+        account_pubkey: None,
+        authority_pubkey: authority_keypair.pubkey(),
+        get_programs: true,
+        get_buffers: false,
+        all: false,
+        use_lamports_unit: false,
+    });
+    let response = process_command(&config).await.unwrap();
+    let json: Value = serde_json::from_str(&response).unwrap();
+    let programs = json
+        .as_object()
+        .unwrap()
+        .get("programs")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let program_id = program_keypair.pubkey().to_string();
+    let program = programs
+        .iter()
+        .find(|program| {
+            program.get("programId").and_then(Value::as_str) == Some(program_id.as_str())
+        })
+        .unwrap();
+    assert_eq!(
+        program.get("dataLen").unwrap().as_u64().unwrap(),
+        max_len as u64
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -3375,9 +3527,7 @@ async fn create_buffer_with_offline_authority<'a>(
         .get_account(&buffer_signer.pubkey())
         .await
         .unwrap();
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(online_signer.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -3396,9 +3546,7 @@ async fn create_buffer_with_offline_authority<'a>(
         .get_account(&buffer_signer.pubkey())
         .await
         .unwrap();
-    if let UpgradeableLoaderState::Buffer { authority_address } =
-        bincode::deserialize(&buffer_account.data).unwrap()
-    {
+    if let UpgradeableLoaderState::Buffer { authority_address } = buffer_account.state().unwrap() {
         assert_eq!(authority_address, Some(offline_signer.pubkey()));
     } else {
         panic!("not a buffer account");
@@ -3503,29 +3651,6 @@ async fn test_cli_program_deploy_with_args(compute_unit_price: Option<u64>, use_
     assert_eq!(program_account.lamports, minimum_balance_for_program);
     assert_eq!(program_account.owner, bpf_loader_upgradeable::id());
     assert!(program_account.executable);
-
-    async fn fetch_and_decode_transaction(
-        rpc_client: &RpcClient,
-        signature: &Signature,
-    ) -> Transaction {
-        rpc_client
-            .get_transaction_with_config(
-                signature,
-                RpcTransactionConfig {
-                    encoding: Some(UiTransactionEncoding::Base64),
-                    commitment: Some(CommitmentConfig::confirmed()),
-                    ..RpcTransactionConfig::default()
-                },
-            )
-            .await
-            .unwrap()
-            .transaction
-            .transaction
-            .decode()
-            .unwrap()
-            .into_legacy_transaction()
-            .unwrap()
-    }
 
     let signatures = loop {
         let statuses = rpc_client

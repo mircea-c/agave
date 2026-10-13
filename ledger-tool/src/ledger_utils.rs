@@ -10,7 +10,7 @@ use {
     log::*,
     solana_accounts_db::{
         accounts_db::TOTAL_IO_URING_BUFFERS_SIZE_LIMIT,
-        utils::{create_all_accounts_run_and_snapshot_dirs, validate_account_paths_for_direct_io},
+        utils::{create_all_accounts_run_dirs, validate_account_paths_for_direct_io},
     },
     solana_clock::Slot,
     solana_core::{
@@ -30,7 +30,6 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
-    solana_pubkey::Pubkey,
     solana_rpc::transaction_status_service::TransactionStatusService,
     solana_runtime::{
         accounts_background_service::{
@@ -43,7 +42,6 @@ use {
         transaction_execution::TransactionStatusSender,
     },
     solana_shred_version::compute_shred_version,
-    solana_transaction::versioned::VersionedTransaction,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{
         path::{Path, PathBuf},
@@ -77,8 +75,8 @@ const PROCESS_SLOTS_HELP_STRING: &str =
 
 #[derive(Error, Debug)]
 pub(crate) enum LoadAndProcessLedgerError {
-    #[error("failed to create all run and snapshot directories: {0}")]
-    CreateAllAccountsRunAndSnapshotDirectories(#[source] std::io::Error),
+    #[error("failed to create all account run directories: {0}")]
+    CreateAllAccountsRunDirectories(#[source] std::io::Error),
 
     #[error("custom accounts path is not supported with read-only blockstore access")]
     CustomAccountsPathUnsupported(#[source] BlockstoreError),
@@ -253,22 +251,18 @@ pub fn load_and_process_ledger(
         vec![non_primary_accounts_path]
     };
 
-    let (account_run_paths, account_snapshot_paths) =
-        create_all_accounts_run_and_snapshot_dirs(&account_paths)
-            .map_err(LoadAndProcessLedgerError::CreateAllAccountsRunAndSnapshotDirectories)?;
+    let account_run_paths = create_all_accounts_run_dirs(&account_paths)
+        .map_err(LoadAndProcessLedgerError::CreateAllAccountsRunDirectories)?;
     // From now on, use run/ paths in the same way as the previous account_paths.
     let account_paths = account_run_paths;
 
     validate_account_paths_for_direct_io(
         snapshot_config.use_direct_io,
-        account_paths
-            .iter()
-            .chain(account_snapshot_paths.iter())
-            .chain([
-                &snapshot_config.full_snapshot_archives_dir,
-                &snapshot_config.incremental_snapshot_archives_dir,
-                &snapshot_config.bank_snapshots_dir,
-            ]),
+        account_paths.iter().chain([
+            &snapshot_config.full_snapshot_archives_dir,
+            &snapshot_config.incremental_snapshot_archives_dir,
+            &snapshot_config.bank_snapshots_dir,
+        ]),
     )
     .map_err(LoadAndProcessLedgerError::ValidateAccountPaths)?;
 
@@ -419,6 +413,7 @@ pub fn load_and_process_ledger(
                 transaction_status_sender.clone(),
                 no_replay_vote_sender,
                 no_prioritization_fee_cache,
+                None,
             );
             bank_forks
                 .write()
@@ -604,16 +599,6 @@ pub fn open_genesis_config_by(ledger_path: &Path, matches: &ArgMatches<'_>) -> G
         eprintln!("Exiting. Failed to open genesis config: {err}");
         exit(1);
     })
-}
-
-pub fn get_program_ids(tx: &VersionedTransaction) -> impl Iterator<Item = &Pubkey> + '_ {
-    let message = &tx.message;
-    let account_keys = message.static_account_keys();
-
-    message
-        .instructions()
-        .iter()
-        .map(|ix| ix.program_id(account_keys))
 }
 
 /// Get the AccessType required, based on `process_options`

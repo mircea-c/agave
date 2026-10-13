@@ -11,9 +11,10 @@ use {
     },
     arc_swap::ArcSwap,
     log::*,
-    solana_clock::{BankId, Slot},
+    solana_clock::Slot,
     solana_entry::{block_component, entry::EntrySummary},
     solana_ledger::entry_notifier_interface::{EntryNotifier, EntryUpdateParentInfo},
+    solana_runtime::bank::BankId,
     std::sync::Arc,
 };
 
@@ -71,7 +72,7 @@ fn convert_finalization_cert(
     } = cert;
     block_footer::BlockFinalizationCert {
         slot: *slot,
-        block_id: *block_id,
+        block_id: block_id.to_hash(),
         final_aggregate: convert_votes_aggregate(final_aggregate),
         notar_aggregate: notar_aggregate.as_ref().map(convert_votes_aggregate),
     }
@@ -112,9 +113,10 @@ impl EntryNotifier for EntryNotifierImpl {
             if !plugin.entry_notifications_enabled() {
                 continue;
             }
-            match plugin
-                .notify_entry_for_bank(ReplicaEntryInfoVersions::V0_0_2(&entry_info), bank_id)
-            {
+            match plugin.notify_entry_for_bank(
+                ReplicaEntryInfoVersions::V0_0_2(&entry_info),
+                bank_id.into(),
+            ) {
                 Err(err) => {
                     error!(
                         "Failed to notify entry, error: ({}) to plugin {}",
@@ -151,7 +153,7 @@ impl EntryNotifier for EntryNotifierImpl {
             }
             match plugin.notify_block_footer(
                 ReplicaBlockFooterInfoVersions::V0_0_2(&block_footer_info),
-                bank_id,
+                bank_id.into(),
             ) {
                 Err(err) => error!(
                     "Failed to notify block footer, error: ({}) to plugin {}",
@@ -170,7 +172,7 @@ impl EntryNotifier for EntryNotifierImpl {
         let plugin_manager = self.plugin_manager.load();
         let update_parent_info = ReplicaEntryUpdateParentInfo {
             slot: update_parent.slot,
-            cleared_bank_id: update_parent.cleared_bank_id,
+            cleared_bank_id: update_parent.cleared_bank_id.into(),
             parent_slot: update_parent.parent_slot,
             parent_block_id: &update_parent.parent_block_id,
         };
@@ -217,7 +219,10 @@ mod tests {
         super::*,
         crate::geyser_plugin_manager::{GeyserPluginManager, LoadedGeyserPlugin},
         agave_geyser_plugin_interface::geyser_plugin_interface::{GeyserPlugin, Result},
-        agave_votor_messages::reward_certificate::{NotarRewardCertificate, SkipRewardCertificate},
+        agave_votor_messages::{
+            consensus_message::BlockId,
+            reward_certificate::{NotarRewardCertificate, SkipRewardCertificate},
+        },
         arc_swap::ArcSwap,
         libloading::Library,
         solana_bls_signatures::{BLS_SIGNATURE_COMPRESSED_SIZE, SignatureCompressed},
@@ -228,11 +233,11 @@ mod tests {
         std::sync::{Arc, Mutex},
     };
 
-    type EntryUpdate = (Slot, BankId, usize, usize);
-    type EntryUpdateParent = (Slot, BankId, Slot, Hash);
+    type EntryUpdate = (Slot, u64, usize, usize);
+    type EntryUpdateParent = (Slot, u64, Slot, Hash);
     // The mirror borrows from the notifying call's stack, so the mock stores
     // an owned Debug snapshot instead of the borrowed struct itself.
-    type BlockFooterUpdate = (Slot, BankId, String);
+    type BlockFooterUpdate = (Slot, u64, String);
 
     #[derive(Debug)]
     struct TestEntryPlugin {
@@ -251,7 +256,7 @@ mod tests {
         fn notify_entry_for_bank(
             &self,
             entry: ReplicaEntryInfoVersions,
-            bank_id: BankId,
+            bank_id: u64,
         ) -> Result<()> {
             let ReplicaEntryInfoVersions::V0_0_2(entry) = entry else {
                 panic!("expected V0_0_2 entry info");
@@ -268,7 +273,7 @@ mod tests {
         fn notify_block_footer(
             &self,
             block_footer: ReplicaBlockFooterInfoVersions,
-            bank_id: BankId,
+            bank_id: u64,
         ) -> Result<()> {
             let ReplicaBlockFooterInfoVersions::V0_0_2(block_footer) = block_footer;
             self.block_footer_updates.lock().unwrap().push((
@@ -348,7 +353,7 @@ mod tests {
             num_transactions: 2,
         };
         let bank_hash = Hash::new_unique();
-        let block_id = Hash::new_unique();
+        let block_id = BlockId::new_unique();
         let signature = SignatureCompressed([7; BLS_SIGNATURE_COMPRESSED_SIZE]);
         let block_footer = VersionedBlockFooter::V1(BlockFooterV1 {
             bank_hash,
@@ -362,7 +367,8 @@ mod tests {
             }),
             skip_reward_cert: Some(SkipRewardCertificate::try_new(41, signature, vec![6]).unwrap()),
             notar_reward_cert: Some(
-                NotarRewardCertificate::try_new(42, block_id, signature, vec![8]).unwrap(),
+                NotarRewardCertificate::try_new(42, block_id.to_hash(), signature, vec![8])
+                    .unwrap(),
             ),
         });
         let expected_block_footer =
@@ -372,7 +378,7 @@ mod tests {
                 block_user_agent: b"test-validator",
                 block_final_cert: Some(block_footer::BlockFinalizationCert {
                     slot: 42,
-                    block_id,
+                    block_id: block_id.to_hash(),
                     final_aggregate: block_footer::VotesAggregate {
                         signature,
                         bitmap: &[1, 2, 3],
@@ -389,21 +395,21 @@ mod tests {
                 }),
                 notar_reward_cert: Some(block_footer::NotarRewardCertificate {
                     slot: 42,
-                    block_id,
+                    block_id: block_id.to_hash(),
                     signature,
                     bitmap: &[8],
                 }),
             });
         let parent_block_id = Hash::new_unique();
 
-        notifier.notify_entry(42, 9, 3, &entry, 7);
+        notifier.notify_entry(42, BankId::new(9), 3, &entry, 7);
         notifier.notify_entry_update_parent(&EntryUpdateParentInfo {
             slot: 42,
-            cleared_bank_id: 9,
+            cleared_bank_id: BankId::new(9),
             parent_slot: 40,
             parent_block_id,
         });
-        notifier.notify_block_footer(42, 9, &block_footer);
+        notifier.notify_block_footer(42, BankId::new(9), &block_footer);
 
         assert_eq!(
             *entry_plugin_entry_updates.lock().unwrap(),

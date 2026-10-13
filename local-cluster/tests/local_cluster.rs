@@ -14,7 +14,7 @@ use {
     rand::seq::SliceRandom,
     serial_test::serial,
     solana_account::AccountSharedData,
-    solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs,
+    solana_accounts_db::utils::create_accounts_run_dir,
     solana_clock::{DEFAULT_SLOTS_PER_EPOCH, DEFAULT_TICKS_PER_SLOT, MAX_PROCESSING_AGE, Slot},
     solana_cluster_type::ClusterType,
     solana_commitment_config::CommitmentConfig,
@@ -48,7 +48,7 @@ use {
         blockstore_processor::{self, ProcessOptions},
         leader_schedule_cache::LeaderScheduleCache,
         shred::{
-            DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, ReedSolomonCache, Shred, Shredder,
+            DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, Shred, Shredder,
             filter::{TurbineMode, TurbineModeKind},
         },
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
@@ -129,6 +129,21 @@ fn create_test_validator_keys(keypairs: &[&str]) -> Vec<(ValidatorKeys, bool)> {
             )
         })
         .collect()
+}
+
+fn copy_ledger_for_fork(source: &Path, destination: &Path) {
+    // Copy only regular files and directories; skip symlinks and special files such as sockets.
+    fs::create_dir(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let destination = destination.join(entry.file_name());
+        let file_type = entry.file_type().unwrap();
+        if file_type.is_dir() {
+            copy_ledger_for_fork(&entry.path(), &destination);
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), destination).unwrap();
+        }
+    }
 }
 
 /// Smoke-tests the `new_with_equal_stakes()` startup path for a single-node cluster.
@@ -284,7 +299,7 @@ fn test_two_unbalanced_stakes() {
     let num_ticks_per_slot = 16;
     let num_slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH;
 
-    let mut cluster = LocalCluster::new(
+    let mut cluster = LocalCluster::new_tower(
         &mut ClusterConfig {
             node_stakes: vec![DEFAULT_NODE_STAKE * 100, DEFAULT_NODE_STAKE],
             mint_lamports: DEFAULT_MINT_LAMPORTS + DEFAULT_NODE_STAKE * 100,
@@ -1249,7 +1264,7 @@ fn test_snapshot_restart_tower() {
         ..ClusterConfig::default()
     };
 
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
 
     // Let the nodes run for a while, then stop one of the validators
     sleep(Duration::from_millis(5000));
@@ -1509,7 +1524,7 @@ fn test_no_voting() {
         validator_configs: vec![validator_config],
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
     let rpc_client = cluster
         .build_rpc_client(cluster.entry_point_info.pubkey())
         .unwrap();
@@ -1568,7 +1583,7 @@ fn test_optimistic_confirmation_violation_detection() {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
     // Let the nodes run for a while. Wait for validators to vote on slot `S`
     // so that the vote on `S-1` is definitely in gossip and optimistic confirmation is
     // detected on slot `S-1` for sure, then stop the heavier of the two
@@ -1782,7 +1797,7 @@ fn test_validator_saves_tower() {
         validator_keys: Some(vec![(validator_keys.clone(), true)]),
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
 
     let rpc_client = cluster.build_rpc_client(&validator_id).unwrap();
 
@@ -1939,7 +1954,7 @@ fn do_test_future_tower(cluster_mode: ClusterMode) {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
 
     let val_a_ledger_path = cluster.ledger_path(&validator_a_pubkey);
     let root_before_restart;
@@ -2108,7 +2123,7 @@ fn test_hard_fork_invalidates_tower() {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let cluster = std::sync::Arc::new(std::sync::Mutex::new(LocalCluster::new(
+    let cluster = std::sync::Arc::new(std::sync::Mutex::new(LocalCluster::new_tower(
         &mut config,
         SocketAddrSpace::Unspecified,
     )));
@@ -2212,11 +2227,7 @@ fn create_snapshot_to_hard_fork(
     let snapshot_config = create_simple_snapshot_config(ledger_path);
     let (bank_forks, _) = bank_forks_utils::try_load_bank_forks_from_snapshot(
         &genesis_config,
-        &[
-            create_accounts_run_and_snapshot_dirs(ledger_path.join("accounts"))
-                .unwrap()
-                .0,
-        ],
+        &[create_accounts_run_dir(ledger_path.join("accounts")).unwrap()],
         &snapshot_config,
         &process_options,
         None,
@@ -2295,7 +2306,7 @@ fn test_hard_fork_with_gap_in_roots() {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let cluster = std::sync::Arc::new(std::sync::Mutex::new(LocalCluster::new(
+    let cluster = std::sync::Arc::new(std::sync::Mutex::new(LocalCluster::new_tower(
         &mut config,
         SocketAddrSpace::Unspecified,
     )));
@@ -2454,7 +2465,7 @@ fn test_restart_tower_rollback() {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
 
     let val_b_ledger_path = cluster.ledger_path(&b_pubkey);
 
@@ -2586,7 +2597,7 @@ fn test_run_test_load_program_accounts_partition_root() {
         None,
         false,
         additional_accounts,
-        false,
+        true,
     );
 }
 
@@ -2634,7 +2645,7 @@ fn test_oc_bad_signatures() {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
 
     // 2) Kill our node and start up a thread to simulate votes to control our voting behavior
     let our_info = cluster.exit_node(&our_id);
@@ -3185,7 +3196,7 @@ fn do_test_lockout_violation_with_or_without_tower(with_tower: bool) {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
 
     let val_a_ledger_path = cluster.ledger_path(&validator_a_pubkey);
     let val_b_ledger_path = cluster.ledger_path(&validator_b_pubkey);
@@ -3230,9 +3241,7 @@ fn do_test_lockout_violation_with_or_without_tower(with_tower: bool) {
     {
         // first copy from validator B's ledger
         std::fs::remove_dir_all(&validator_c_info.info.ledger_path).unwrap();
-        let mut opt = fs_extra::dir::CopyOptions::new();
-        opt.copy_inside = true;
-        fs_extra::dir::copy(&val_b_ledger_path, &val_c_ledger_path, &opt).unwrap();
+        copy_ledger_for_fork(&val_b_ledger_path, &val_c_ledger_path);
         // Remove B's tower in C's new copied ledger
         remove_tower(&val_c_ledger_path, &validator_b_pubkey);
 
@@ -4296,27 +4305,20 @@ fn find_latest_replayed_slot_from_ledger(
     }
 }
 
-/// Baseline partition/recovery smoke test for the generic cluster-partition harness.
-/// Stricter fork-choice assertions are covered by separate partition tests.
-#[test]
-#[serial]
-fn test_cluster_partition_1_1_1() {
-    run_test_cluster_partition(3, false);
-}
-
 /// Partition/recovery test for Alpenglow
 #[test]
 #[serial]
 fn test_cluster_partition_1_1_1_alpenglow() {
-    run_test_cluster_partition(3, true);
+    run_test_cluster_partition(3);
 }
 
-fn run_test_cluster_partition(num_partitions: usize, is_alpenglow: bool) {
+fn run_test_cluster_partition(num_partitions: usize) {
     let empty = |_: &mut LocalCluster, _: &mut ()| {};
     let on_partition_resolved = |cluster: &mut LocalCluster, _: &mut ()| {
         cluster.check_for_new_roots(16, "PARTITION_TEST", SocketAddrSpace::Unspecified);
     };
     let partition_sizes = vec![1; num_partitions];
+    let is_alpenglow = true;
     run_cluster_partition(
         &partition_sizes,
         None,
@@ -4443,7 +4445,7 @@ fn test_slot_hash_expiry() {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
 
     let mut common_ancestor_slot = 8;
 
@@ -4470,9 +4472,7 @@ fn test_slot_hash_expiry() {
     {
         info!("Copying A's ledger to B");
         std::fs::remove_dir_all(&b_info.info.ledger_path).unwrap();
-        let mut opt = fs_extra::dir::CopyOptions::new();
-        opt.copy_inside = true;
-        fs_extra::dir::copy(&a_ledger_path, &b_ledger_path, &opt).unwrap();
+        copy_ledger_for_fork(&a_ledger_path, &b_ledger_path);
 
         // remove A's tower in B's new copied ledger
         info!("Removing A's tower in B's ledger dir");
@@ -4679,7 +4679,7 @@ fn test_duplicate_with_pruned_ancestor() {
         skip_warmup_slots: true,
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new_tower(&mut config, SocketAddrSpace::Unspecified);
 
     let majority_ledger_path = cluster.ledger_path(&majority_pubkey);
     let minority_ledger_path = cluster.ledger_path(&minority_pubkey);
@@ -4792,9 +4792,7 @@ fn test_duplicate_with_pruned_ancestor() {
         {
             // Copy majority fork
             std::fs::remove_dir_all(&our_node_info.info.ledger_path).unwrap();
-            let mut opt = fs_extra::dir::CopyOptions::new();
-            opt.copy_inside = true;
-            fs_extra::dir::copy(&majority_ledger_path, &our_node_ledger_path, &opt).unwrap();
+            copy_ledger_for_fork(&majority_ledger_path, &our_node_ledger_path);
             remove_tower(&our_node_ledger_path, &majority_pubkey);
         }
 
@@ -5740,7 +5738,7 @@ fn test_invalid_forks_persisted_on_restart() {
     // Majority shouldn't duplicate confirm anything
     validator_configs[1].voting_disabled = true;
 
-    let mut cluster = LocalCluster::new(
+    let mut cluster = LocalCluster::new_tower(
         &mut ClusterConfig {
             mint_lamports: DEFAULT_MINT_LAMPORTS + node_stakes.iter().sum::<u64>(),
             validator_configs,
@@ -5797,7 +5795,6 @@ fn test_invalid_forks_persisted_on_restart() {
                 Hash::default(), // chained_merkle_root
                 0,               // next_shred_index,
                 0,               // next_code_index
-                &ReedSolomonCache::default(),
                 &mut ProcessShredsStats::default(),
             )
             .0;
@@ -5884,7 +5881,7 @@ fn test_alpenglow_nodes_basic(num_nodes: usize, num_offline_nodes: usize) {
         },
         ..ClusterConfig::default()
     };
-    let mut cluster = LocalCluster::new_alpenglow(&mut config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
     assert_eq!(cluster.validators.len(), num_nodes);
 
     // Check transactions land
@@ -5950,7 +5947,7 @@ fn test_restart_node_alpenglow() {
     let slots_per_epoch = MINIMUM_SLOTS_PER_EPOCH * 2;
     let ticks_per_slot = 16;
     let validator_config = ValidatorConfig::default_for_test();
-    let mut cluster = LocalCluster::new_alpenglow(
+    let mut cluster = LocalCluster::new(
         &mut ClusterConfig {
             node_stakes: vec![DEFAULT_NODE_STAKE],
             validator_configs: vec![safe_clone_config(&validator_config)],
@@ -6051,8 +6048,7 @@ fn test_alpenglow_imbalanced_stakes_catchup() {
     };
 
     // Create local cluster
-    let mut cluster =
-        LocalCluster::new_alpenglow(&mut cluster_config, SocketAddrSpace::Unspecified);
+    let mut cluster = LocalCluster::new(&mut cluster_config, SocketAddrSpace::Unspecified);
 
     // Ensure all nodes are voting
     cluster.check_for_new_processed(
@@ -6147,7 +6143,7 @@ fn test_alpenglow_basic_equivocation() {
     };
 
     // Create local cluster
-    let cluster = LocalCluster::new_alpenglow(&mut cluster_config, SocketAddrSpace::Unspecified);
+    let cluster = LocalCluster::new(&mut cluster_config, SocketAddrSpace::Unspecified);
     let node_b_pubkey = validator_keys[1].node_keypair.pubkey();
 
     // Check to make sure the low staked node observes duplicate blocks
@@ -6244,7 +6240,7 @@ fn test_alpenglow_migration(
     ));
 
     // Create local cluster with alpenglow accounts but feature not activated
-    let cluster = LocalCluster::new(&mut cluster_config, SocketAddrSpace::Unspecified);
+    let cluster = LocalCluster::new_tower(&mut cluster_config, SocketAddrSpace::Unspecified);
 
     let validator_keys: Vec<Arc<Keypair>> =
         keys.iter().map(|keys| keys.node_keypair.clone()).collect();

@@ -31,6 +31,7 @@ use {
         tpu::{Tpu, TpuSockets},
         tvu::{AlpenglowInitializationState, Tvu, TvuConfig, TvuSockets},
     },
+    agave_jemalloc::group::ArenaGroup,
     agave_snapshots::{
         SnapshotInterval, snapshot_archive_info::SnapshotArchiveInfoGetter as _,
         snapshot_config::SnapshotConfig, snapshot_hash::StartingSnapshotHashes,
@@ -333,7 +334,6 @@ pub struct ValidatorConfig {
     pub expected_shred_version: Option<u16>,
     pub voting_disabled: bool,
     pub account_paths: Vec<PathBuf>,
-    pub account_snapshot_paths: Vec<PathBuf>,
     pub rpc_config: JsonRpcConfig,
     /// Specifies which plugins to start up with
     pub on_start_geyser_plugin_config_files: Option<Vec<PathBuf>>,
@@ -384,7 +384,6 @@ pub struct ValidatorConfig {
     pub process_ledger_before_services: bool,
     pub accounts_db_config: AccountsDbConfig,
     pub warp_slot: Option<Slot>,
-    pub accounts_db_force_initial_clean: bool,
     pub staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
     pub validator_exit: Arc<RwLock<Exit>>,
     pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
@@ -401,6 +400,7 @@ pub struct ValidatorConfig {
     pub generator_config: Option<GeneratorConfig>,
     pub use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup,
     pub unified_scheduler_handler_threads: Option<usize>,
+    pub replay_arenas: Option<usize>,
     pub ip_echo_server_threads: NonZeroUsize,
     pub rayon_global_threads: NonZeroUsize,
     pub replay_forks_threads: NonZeroUsize,
@@ -424,7 +424,6 @@ impl ValidatorConfig {
             blockstore_cleanup_strategy: BlockstoreCleanupStrategy::None,
             blockstore_options: BlockstoreOptions::default_for_tests(),
             account_paths: Vec::new(),
-            account_snapshot_paths: Vec::new(),
             rpc_config: JsonRpcConfig::default_for_test(),
             on_start_geyser_plugin_config_files: None,
             geyser_plugin_always_enabled: false,
@@ -465,7 +464,6 @@ impl ValidatorConfig {
             poh_hashes_per_batch: poh_service::DEFAULT_HASHES_PER_BATCH,
             process_ledger_before_services: false,
             warp_slot: None,
-            accounts_db_force_initial_clean: false,
             staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
             validator_exit: Arc::new(RwLock::new(Exit::default())),
             validator_exit_backpressure: HashMap::default(),
@@ -484,6 +482,7 @@ impl ValidatorConfig {
             generator_config: None,
             use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup::default(),
             unified_scheduler_handler_threads: None,
+            replay_arenas: None,
             // Fix threadpools to small and reasonable sizes; unit tests should
             // not be creating excessive load and benches can configure more
             ip_echo_server_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
@@ -549,15 +548,15 @@ pub enum ValidatorStartProgress {
 pub struct XdpTransmitSetup {
     pub transmitter_builder: TransmitterBuilder,
     pub src_ip: Ipv4Addr,
-    pub modules: XdpModules,
+    pub components: XdpComponents,
 }
 
-/// Per-module XDP sender positions. `None` means the module uses OS sockets.
+/// Per-component XDP sender positions. `None` means the component uses OS sockets.
 ///
 /// Positions index into the configured queue list (`XdpConfig::queues`), not into NIC hardware
 /// queue ids.
 #[derive(Clone, Debug)]
-pub struct XdpModules {
+pub struct XdpComponents {
     pub tpu: Option<Box<[usize]>>,
     pub turbine: Option<Box<[usize]>>,
     pub repair: Option<Box<[usize]>>,
@@ -565,9 +564,9 @@ pub struct XdpModules {
     pub votor: Option<Box<[usize]>>,
 }
 
-impl XdpModules {
+impl XdpComponents {
     fn validate_sender_positions(&self, sender_count: usize) -> Result<()> {
-        for (module, positions) in [
+        for (component, positions) in [
             ("tpu", &self.tpu),
             ("turbine", &self.turbine),
             ("repair", &self.repair),
@@ -578,7 +577,9 @@ impl XdpModules {
                 continue;
             };
             if let Err(err) = XdpSender::validate_subset_positions(positions, sender_count) {
-                return Err(anyhow!("invalid XDP sender positions for {module}: {err}"));
+                return Err(anyhow!(
+                    "invalid XDP sender positions for {component}: {err}"
+                ));
             }
         }
         Ok(())
@@ -1152,12 +1153,31 @@ impl Validator {
         }
         let banking_tracer_channels = banking_tracer.create_channels();
 
+        // This threshold is the size above which jemalloc will allocate straight from the kernel
+        // instead of the arena. The default is 8MB, which is not good for us since accounts can be
+        // 10MB.
+        const REPLAY_ARENA_OVERSIZE_THRESHOLD: usize = 16 * 1024 * 1024;
+        // Jemalloc allows an allocation to reuse a dirty extent if the allocation is at least
+        // 1/64th the size of the extent. Around the epoch boundary we can spike +-3GB. Cap extent
+        // size so that the memory allocated to serve spikes stays reusable and doesn't become dirty
+        // but unsplittable forever. See jemalloc's lg_extent_max_active_fit.
+        const REPLAY_ARENA_RETAIN_GROW_LIMIT: usize = 64 * 1024 * 1024;
+        let replay_arenas = config.replay_arenas.map(|arena_count| {
+            ArenaGroup::new(
+                arena_count,
+                REPLAY_ARENA_OVERSIZE_THRESHOLD,
+                REPLAY_ARENA_RETAIN_GROW_LIMIT,
+            )
+            .expect("failed to create replay arenas")
+        });
+        let replay_arena = replay_arenas.as_ref().map(|arenas| arenas[0]);
         let scheduler_pool = DefaultSchedulerPool::new(
             config.unified_scheduler_handler_threads,
             config.runtime_config.log_messages_bytes_limit,
             transaction_status_sender.clone(),
             Some(replay_vote_sender.clone()),
             prioritization_fee_cache.clone(),
+            replay_arenas,
         );
         bank_forks
             .write()
@@ -1465,7 +1485,7 @@ impl Validator {
         ) = if let Some(XdpTransmitSetup {
             transmitter_builder,
             src_ip,
-            modules,
+            components,
         }) = xdp_transmit_setup
         {
             let turbine_src_port = node.sockets.retransmit_sockets[0]
@@ -1485,12 +1505,12 @@ impl Validator {
                 .expect("gossip socket should have local address")
                 .port();
 
-            modules.validate_sender_positions(transmitter_builder.sender_count())?;
+            components.validate_sender_positions(transmitter_builder.sender_count())?;
             let (transmitter, sender) = transmitter_builder.build();
 
             (
                 Some(transmitter),
-                modules.turbine.map(|positions| {
+                components.turbine.map(|positions| {
                     PinnedXdpSender::new(
                         sender
                             .subset(&positions)
@@ -1498,7 +1518,7 @@ impl Validator {
                         SocketAddrV4::new(src_ip, turbine_src_port),
                     )
                 }),
-                modules.tpu.map(|positions| {
+                components.tpu.map(|positions| {
                     (
                         sender
                             .subset(&positions)
@@ -1506,7 +1526,7 @@ impl Validator {
                         src_ip,
                     )
                 }),
-                modules.repair.map(|positions| {
+                components.repair.map(|positions| {
                     PinnedXdpSender::new(
                         sender
                             .subset(&positions)
@@ -1514,7 +1534,7 @@ impl Validator {
                         SocketAddrV4::new(src_ip, repair_src_port),
                     )
                 }),
-                modules.gossip.map(|positions| {
+                components.gossip.map(|positions| {
                     PinnedXdpSender::new(
                         sender
                             .subset(&positions)
@@ -1522,7 +1542,7 @@ impl Validator {
                         SocketAddrV4::new(src_ip, gossip_src_port),
                     )
                 }),
-                modules.votor.map(|positions| {
+                components.votor.map(|positions| {
                     (
                         sender
                             .subset(&positions)
@@ -1730,6 +1750,7 @@ impl Validator {
                 bls_sigverify_threads: config.tvu_bls_sigverify_threads,
                 turbine_xdp_sender: turbine_xdp_sender.clone(),
                 repair_xdp_sender,
+                replay_arena,
             },
             &max_slots,
             block_metadata_notifier,
@@ -1737,7 +1758,7 @@ impl Validator {
             Some(snapshot_controller.clone()),
             banking_tracer,
             outstanding_repair_requests.clone(),
-            cluster_slots.clone(),
+            cluster_slots,
             slot_status_notifier,
             vote_connection_cache,
             AlpenglowInitializationState {
@@ -1866,7 +1887,6 @@ impl Validator {
             notifies: key_notifiers,
             repair_socket: Arc::new(node.sockets.repair),
             outstanding_repair_requests,
-            cluster_slots,
             node: Some(node_multihoming),
             banking_control_sender,
             snapshot_controller,
@@ -2429,7 +2449,6 @@ fn load_blockstore(
         new_hard_forks: config.new_hard_forks.clone(),
         debug_keys: config.debug_keys.clone(),
         accounts_db_config: config.accounts_db_config.clone(),
-        accounts_db_force_initial_clean: config.accounts_db_force_initial_clean,
         runtime_config: config.runtime_config.clone(),
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
         ..blockstore_processor::ProcessOptions::default()
@@ -3177,15 +3196,11 @@ fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: boo
 fn validate_account_paths(config: &ValidatorConfig) -> std::io::Result<()> {
     validate_account_paths_for_direct_io(
         config.snapshot_config.use_direct_io,
-        config
-            .account_paths
-            .iter()
-            .chain(&config.account_snapshot_paths)
-            .chain([
-                &config.snapshot_config.full_snapshot_archives_dir,
-                &config.snapshot_config.incremental_snapshot_archives_dir,
-                &config.snapshot_config.bank_snapshots_dir,
-            ]),
+        config.account_paths.iter().chain([
+            &config.snapshot_config.full_snapshot_archives_dir,
+            &config.snapshot_config.incremental_snapshot_archives_dir,
+            &config.snapshot_config.bank_snapshots_dir,
+        ]),
     )
 }
 
@@ -3231,15 +3246,15 @@ mod tests {
     };
 
     #[test]
-    fn test_xdp_modules_validate_sender_positions_with_module_context() {
-        let modules = XdpModules {
+    fn test_xdp_components_validate_sender_positions_with_component_context() {
+        let components = XdpComponents {
             tpu: Some([0].into()),
             turbine: None,
             repair: Some([1, 1].into()),
             gossip: None,
             votor: None,
         };
-        let error = modules.validate_sender_positions(2).unwrap_err();
+        let error = components.validate_sender_positions(2).unwrap_err();
         assert!(
             error.to_string().contains("repair") && error.to_string().contains("is repeated"),
             "unexpected error: {error}"

@@ -1,5 +1,7 @@
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
+#[cfg(feature = "stable-abi")]
+use solana_frozen_abi_macro::{StableAbi, StableAbiSample};
 use {
     crate::{stake_history::StakeHistory, stakes::SerdeStakesToStakeFormat},
     solana_bls_signatures::pubkey::{
@@ -156,6 +158,12 @@ impl BLSPubkeyToRankMap {
         self.sorted_pubkeys.get(index)
     }
 
+    /// Iterates over validators in rank order.
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &BLSPubkeyStakeEntry)> {
+        // Construction checks that every rank fits in a u16.
+        (0..=u16::MAX).zip(&self.sorted_pubkeys)
+    }
+
     /// Returns a node's rank and its canonical stake entry.
     #[inline]
     pub fn get_ranked_entry_for_node(
@@ -168,7 +176,7 @@ impl BLSPubkeyToRankMap {
     }
 }
 
-#[cfg_attr(feature = "frozen-abi", derive(StableAbi, StableAbiSample))]
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, SchemaRead, SchemaWrite)]
 pub struct NodeVoteAccounts {
     pub vote_accounts: Vec<Pubkey>,
@@ -180,7 +188,7 @@ pub struct NodeVoteAccounts {
 /// Its bincode serializaiton format is identical as `VersionedEpochStakes`, but allows faster
 /// deserialization by ignoring serialized stake delegations entirely.
 #[cfg_attr(
-    feature = "frozen-abi",
+    feature = "stable-abi",
     derive(SchemaWrite, StableAbi, StableAbiSample)
 )]
 #[derive(Clone, Debug, SchemaRead)]
@@ -188,7 +196,7 @@ pub struct NodeVoteAccounts {
 pub(crate) enum DeserializableVersionedEpochStakes {
     Current {
         #[cfg_attr(
-            feature = "frozen-abi",
+            feature = "stable-abi",
             stable_abi_sample(with = "stable_abi_sample_deserializable_epoch_stakes(rng)")
         )]
         stakes: DeserializableEpochStakes,
@@ -200,7 +208,7 @@ pub(crate) enum DeserializableVersionedEpochStakes {
 
 /// Draws in `EpochStakes` declaration order (`epoch` first, not wire order) so the sample matches
 /// the serialize side; the serializer injects empty `stake_delegations`/zero `unused`, mirrored here.
-#[cfg(feature = "frozen-abi")]
+#[cfg(feature = "stable-abi")]
 fn stable_abi_sample_deserializable_epoch_stakes(
     rng: &mut (impl solana_frozen_abi::rand::RngCore + ?Sized),
 ) -> DeserializableEpochStakes {
@@ -218,7 +226,7 @@ fn stable_abi_sample_deserializable_epoch_stakes(
 }
 
 #[derive(Clone, Debug, SchemaWrite)]
-#[cfg_attr(feature = "frozen-abi", derive(StableAbi, StableAbiSample))]
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
 #[cfg_attr(feature = "dev-context-only-utils", derive(PartialEq))]
 pub enum VersionedEpochStakes {
     Current {
@@ -227,7 +235,7 @@ pub enum VersionedEpochStakes {
         total_stake: u64,
         node_id_to_vote_accounts: Arc<NodeIdToVoteAccounts>,
         epoch_authorized_voters: Arc<EpochAuthorizedVoters>,
-        #[cfg_attr(feature = "frozen-abi", stable_abi_sample(with = "Default::default()"))]
+        #[cfg_attr(feature = "stable-abi", stable_abi_sample(with = "Default::default()"))]
         #[wincode(skip)]
         bls_pubkey_to_rank_map: OnceLock<Arc<BLSPubkeyToRankMap>>,
     },
@@ -390,7 +398,7 @@ impl VersionedEpochStakes {
 
 /// The current version of epoch stakes
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "frozen-abi", derive(StableAbi, StableAbiSample))]
+#[cfg_attr(feature = "stable-abi", derive(StableAbi, StableAbiSample))]
 #[cfg_attr(feature = "dev-context-only-utils", derive(PartialEq))]
 pub struct EpochStakes {
     epoch: Epoch,
@@ -465,7 +473,7 @@ impl From<SerdeStakesToStakeFormat> for EpochStakes {
 /// Needed because snapshots contain additional fields no longer present in EpochStakes.
 // Sampling is overridden at the parent (`DeserializableVersionedEpochStakes::Current.stakes`), so
 // no StableAbi/StableAbiSample is needed here.
-#[cfg_attr(feature = "frozen-abi", derive(SchemaWrite))]
+#[cfg_attr(feature = "stable-abi", derive(SchemaWrite))]
 #[derive(Clone, Debug, SchemaRead)]
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) struct DeserializableEpochStakes {
@@ -691,6 +699,12 @@ pub(crate) mod tests {
         });
         let epoch_stakes = VersionedEpochStakes::new_for_tests(epoch_vote_accounts.clone(), 0);
         let bls_pubkey_to_rank_map = epoch_stakes.bls_pubkey_to_rank_map();
+        for (rank, entry) in bls_pubkey_to_rank_map.iter() {
+            assert_eq!(
+                bls_pubkey_to_rank_map.get_rank_for_vote_pubkey(&entry.vote_account_pubkey),
+                Some(&rank),
+            );
+        }
         let expected_num_vote_accounts = num_vote_accounts;
         assert_eq!(bls_pubkey_to_rank_map.len(), expected_num_vote_accounts);
         let expected_total_stake = epoch_stakes.total_stake();

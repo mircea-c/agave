@@ -7,7 +7,10 @@ use {
     },
     crate::cluster_nodes::ClusterNodesCache,
     agave_votor::event::VotorEventSender,
-    agave_votor_messages::{consensus_message::Block, migration::MigrationStatus},
+    agave_votor_messages::{
+        consensus_message::{Block, BlockId},
+        migration::MigrationStatus,
+    },
     solana_cost_model::shred_limit::{
         DEFAULT_MAX_CODE_SHREDS_PER_SLOT, DEFAULT_MAX_DATA_SHREDS_PER_SLOT,
     },
@@ -16,10 +19,7 @@ use {
     solana_keypair::Keypair,
     solana_ledger::{
         leader_schedule_cache::LeaderScheduleCache,
-        shred::{
-            ProcessShredsStats, ReedSolomonCache, Shred, ShredType, Shredder,
-            merkle_tree::MerkleTree,
-        },
+        shred::{ProcessShredsStats, Shred, ShredType, Shredder, merkle_tree::MerkleTree},
     },
     solana_runtime::bank::Bank,
     solana_sha256_hasher::hashv,
@@ -59,7 +59,6 @@ pub struct StandardBroadcastRun {
     num_batches: usize,
     cluster_nodes_cache: Arc<ClusterNodesCache<BroadcastStage>>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
-    reed_solomon_cache: Arc<ReedSolomonCache>,
     migration_status: Arc<MigrationStatus>,
     votor_event_sender: VotorEventSender,
     max_data_shreds_per_slot: u32,
@@ -89,7 +88,7 @@ impl StandardBroadcastRun {
             parent_block_id: Hash::default(),
             parent_for_double_merkle: Block {
                 slot: Slot::MAX,
-                block_id: Hash::default(),
+                block_id: BlockId::default(),
             },
             chained_merkle_root: Hash::default(),
             double_merkle_leaves: vec![],
@@ -106,7 +105,6 @@ impl StandardBroadcastRun {
             num_batches: 0,
             cluster_nodes_cache,
             leader_schedule_cache,
-            reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
             migration_status,
             votor_event_sender,
             max_data_shreds_per_slot: DEFAULT_MAX_DATA_SHREDS_PER_SLOT,
@@ -160,7 +158,9 @@ impl StandardBroadcastRun {
             ) {
                 Ok(chained_merkle_root) => chained_merkle_root,
                 // This is a snapshot slot that we don't have the shreds for. Use the block id from the snapshot
-                Err(Error::UnknownLastIndex(_)) | Err(Error::UnknownSlotMeta(_)) => parent_block_id,
+                Err(Error::UnknownLastIndex(_)) | Err(Error::UnknownSlotMeta(_)) => {
+                    parent_block_id.to_hash()
+                }
                 Err(e) => panic!(
                     "Unexpected error while producing leader block for {}: {e:?}",
                     bank.slot()
@@ -170,7 +170,7 @@ impl StandardBroadcastRun {
 
         self.slot = bank.slot();
         self.parent = bank.parent_slot();
-        self.parent_block_id = parent_block_id;
+        self.parent_block_id = parent_block_id.to_hash();
         self.parent_for_double_merkle = Block {
             slot: bank.parent_slot(),
             block_id: parent_block_id,
@@ -207,7 +207,6 @@ impl StandardBroadcastRun {
                 self.chained_merkle_root,
                 self.next_shred_index,
                 self.next_code_index,
-                &self.reed_solomon_cache,
                 &mut self.process_shreds_stats,
             );
         // These shreds will finish the slot so no need to update
@@ -241,7 +240,6 @@ impl StandardBroadcastRun {
                     self.chained_merkle_root,
                     self.next_shred_index,
                     self.next_code_index,
-                    &self.reed_solomon_cache,
                     process_stats,
                 );
         shreds.iter().for_each(|shred| {
@@ -854,7 +852,7 @@ mod test {
         assert!(Arc::ptr_eq(&header_shreds, &transmit_shreds));
         assert_eq!(
             deshred_component(&header_shreds),
-            BlockComponent::new_block_header(parent_bank.slot(), parent_block_id),
+            BlockComponent::new_block_header(parent_bank.slot(), parent_block_id.to_hash()),
         );
         let header_data_shred = header_shreds.iter().find(|shred| shred.is_data()).unwrap();
         let flags = layout::get_flags(header_data_shred.payload().as_ref()).unwrap();
@@ -1107,7 +1105,7 @@ mod test {
 
         // Step 2: Make a transmission for another bank that interrupts the transmission for
         // slot 1
-        bank1.set_block_id(Some(Hash::new_unique()));
+        bank1.set_block_id(Some(BlockId::new_unique()));
         let bank2 = new_child_bank(&bank1, 2);
         let interrupted_slot = standard_broadcast_run.slot;
         // Interrupting the slot should cause the unfinished_slot and stats to reset
@@ -1484,11 +1482,11 @@ mod test {
         bs.parent_block_id = original_parent_block_id;
         bs.parent_for_double_merkle = Block {
             slot: bs.parent,
-            block_id: bs.parent_block_id,
+            block_id: BlockId::from(bs.parent_block_id),
         };
 
         let new_parent_slot = 7;
-        let new_parent_block_id = Hash::new_unique();
+        let new_parent_block_id = BlockId::new_unique();
         let component = BlockComponent::new_block_marker(VersionedBlockMarker::from_update_parent(
             solana_entry::block_component::UpdateParentV1 {
                 new_parent_slot,
