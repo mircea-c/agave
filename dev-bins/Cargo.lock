@@ -1137,6 +1137,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6007,7 +6013,7 @@ version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc6e56bdda53ef11a97350c776266f81550e76a7fe4675a542ef63354439c333"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "serde_core",
  "solana-instruction-error 3.1.0",
 ]
@@ -6103,7 +6109,7 @@ dependencies = [
 name = "solana-bpf-loader-program"
 version = "4.5.0-alpha.2"
 dependencies = [
- "bincode",
+ "bincode 3.0.0",
  "qualifier_attr",
  "solana-account",
  "solana-bincode",
@@ -6451,7 +6457,7 @@ dependencies = [
  "arc-swap",
  "arrayvec",
  "assert_matches",
- "bincode",
+ "bincode 3.0.0",
  "bitvec",
  "bytes",
  "chrono",
@@ -7050,7 +7056,7 @@ version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ea8442b67a58dd54d5497bfc6cd3106b00f9fe6f6877d33c271c3ec4672eedc"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "serde",
  "solana-define-syscall 5.2.0",
  "solana-pubkey 4.4.0",
@@ -8454,7 +8460,7 @@ version = "4.5.0-alpha.2"
 dependencies = [
  "agave-reserved-account-keys",
  "base64 0.23.1",
- "bincode",
+ "bincode 3.0.0",
  "bzip2",
  "flate2",
  "futures 0.3.34",
@@ -9283,7 +9289,7 @@ checksum = "78a601443971629485248f27272ca2456c94e8aca559ce6e44b8335f11e80ed4"
 dependencies = [
  "aes-gcm-siv",
  "base64 0.23.1",
- "bincode",
+ "bincode 1.3.3",
  "bytemuck",
  "curve25519-dalek 4.1.3",
  "getrandom 0.2.17",
