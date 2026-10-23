@@ -9137,7 +9137,7 @@ version = "4.5.0-alpha.2"
 dependencies = [
  "log",
  "qualifier_attr",
- "rand 0.9.5",
+ "rand 0.10.2",
  "serde",
  "solana-account",
  "solana-bls-signatures",
