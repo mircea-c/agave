@@ -334,7 +334,7 @@ version = "4.5.0-alpha.2"
 dependencies = [
  "assert_matches",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "solana-hash",
  "solana-sha256-hasher",
  "test-case",
@@ -5854,6 +5854,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_chacha"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7125,7 +7135,7 @@ dependencies = [
  "num_cpus",
  "qualifier_attr",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "rayon",
  "semver 1.0.28",
  "seqlock",
@@ -7966,7 +7976,7 @@ dependencies = [
  "indexmap 2.14.2",
  "log",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "solana-keypair",
  "solana-measure",
  "solana-metrics",
@@ -8023,7 +8033,7 @@ dependencies = [
  "num_enum",
  "qualifier_attr",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "rayon",
  "rolling-file",
  "rts-alloc",
@@ -8725,7 +8735,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "qualifier_attr",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "rayon",
  "serial_test",
  "solana-bloom",
@@ -9001,7 +9011,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "solana-lattice-hash",
 ]
 
@@ -9012,7 +9022,7 @@ dependencies = [
  "agave-random",
  "itertools 0.15.0",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "solana-clock",
  "solana-pubkey 4.4.0",
  "solana-sha256-hasher",
@@ -9056,7 +9066,7 @@ dependencies = [
  "prost 0.14.4",
  "qualifier_attr",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "rayon",
  "reed-solomon-erasure",
  "rocksdb",
@@ -9444,7 +9454,7 @@ dependencies = [
  "nix",
  "num_cpus",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "rayon",
  "serde",
  "solana-clock",
@@ -11504,7 +11514,7 @@ dependencies = [
  "log",
  "lru 0.18.5",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand_chacha 0.10.0",
  "rayon",
  "scopeguard",
  "solana-clock",
